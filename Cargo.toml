@@ -1,7 +1,7 @@
 [workspace]
 
 [package]
-name = "provisioner"
+name = "wlan0-bootstrap"
 version = "0.1.0"
 edition = "2024"
 
@@ -49,12 +49,6 @@ async-trait = "0.1.79"
 
 # MIME 类型推断
 mime_guess = "2.0.5"
-
-[features]
-default = []
-# 语音播报特性
-audio = []
-
 
 # release 配置
 [profile.release]

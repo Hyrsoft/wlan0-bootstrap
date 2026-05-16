@@ -3,6 +3,7 @@
 ## 代码规范
 
 所有 Rust 代码修改必须遵守 [docs/RUST_CODE_STYLE.md](docs/RUST_CODE_STYLE.md)。
+所有 Git 提交信息必须遵守 [docs/GIT_COMMIT_CONVENTION.md](docs/GIT_COMMIT_CONVENTION.md)。
 
 生成或审查代码时必须重点检查：
 

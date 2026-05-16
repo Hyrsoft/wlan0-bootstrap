@@ -1,6 +1,3 @@
-# Built-in fallback config for wlan0-bootstrap.
-# Product deployments should install /etc/wlan0-bootstrap/config.toml instead.
-
 [interface]
 name = "wlan0"
 

@@ -1,5 +1,5 @@
 use crate::traits::UiAssetProvider;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rust_embed::RustEmbed;
 use std::borrow::Cow;

@@ -114,9 +114,9 @@ wlan-bootstrap-<suffix>.local
 `suffix` 的候选来源按优先级：
 
 1. 配置文件显式指定。
-2. `wlan0` MAC 地址后 4 到 6 位。
-3. 设备序列号或 SoC ID 的短 hash。
-4. 随机生成并持久化到 `/data/wlan0-bootstrap/device-id`。
+2. 随机生成 6 位 ID，并持久化到 `/data/wlan0-bootstrap/device-id`。
+
+不要使用 `wlan0` MAC 地址作为默认后缀；部分量产设备或同批网卡可能出现重复 MAC，导致 `.local` 名称冲突。
 
 示例：
 

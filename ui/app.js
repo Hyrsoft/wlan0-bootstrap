@@ -9,9 +9,27 @@ document.addEventListener('DOMContentLoaded', () => {
   const cancelBtn = document.getElementById('cancel-btn');
   const connectionStatus = document.getElementById('connection-status');
   const modalClose = document.getElementById('modal-close');
+  const discoveryHint = document.getElementById('discovery-hint');
 
   let selectedSsid = null;
   let statusTimer = null;
+  let plannedHostname = null;
+
+  async function fetchInitialStatus() {
+    try {
+      const res = await fetch('/api/status');
+      if (!res.ok) return false;
+      const status = await res.json();
+      updateDiscoveryHint(status);
+      if (status.state === 'Connected') {
+        renderConnectedPanel(status);
+        return true;
+      }
+    } catch (err) {
+      return false;
+    }
+    return false;
+  }
 
   function showScannerStatus(text) {
     wifiList.innerHTML = `<div class="scanner-status"><div class="spinner"></div><div class="scanner-text">${escapeHtml(text)}</div></div>`;
@@ -72,7 +90,7 @@ document.addEventListener('DOMContentLoaded', () => {
     selectedSsid = ssid;
     modalSsid.textContent = `连接 ${ssid}`;
     passwordInput.value = '';
-    connectionStatus.textContent = '';
+    connectionStatus.innerHTML = plannedHostname ? preconnectHostnameHtml() : '';
     connectionStatus.style.color = '';
     modal.style.display = 'flex';
     modal.setAttribute('aria-hidden', 'false');
@@ -99,7 +117,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const e = await res.json().catch(() => ({ message: '连接请求失败' }));
         throw new Error(e.message || '连接请求失败');
       }
-      connectionStatus.textContent = '请求已接收，正在连接...';
+      connectionStatus.innerHTML = plannedHostname
+        ? `请求已接收，正在连接...${preconnectHostnameHtml()}`
+        : '请求已接收，正在连接...';
       startStatusPolling();
     } catch (err) {
       connectionStatus.textContent = '连接失败：' + err.message;
@@ -114,6 +134,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const res = await fetch('/api/status');
         if (!res.ok) return;
         const status = await res.json();
+        updateDiscoveryHint(status);
         renderConnectionStatus(status);
       } catch (err) {
         clearStatusTimer();
@@ -124,8 +145,9 @@ document.addEventListener('DOMContentLoaded', () => {
   function renderConnectionStatus(status) {
     const state = status.state || 'Unknown';
     if (state === 'Connected') {
-      connectionStatus.textContent = '连接成功，设备正在切换到目标 Wi‑Fi。';
+      connectionStatus.innerHTML = connectedStatusHtml(status);
       connectionStatus.style.color = '#2dd4bf';
+      renderConnectedPanel(status);
       clearStatusTimer();
       setTimeout(closeModal, 2000);
       return;
@@ -140,6 +162,51 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     connectionStatus.textContent = `当前状态：${state}`;
+  }
+
+  function updateDiscoveryHint(status) {
+    if (!status || !status.hostname || !discoveryHint) return;
+    plannedHostname = status.hostname;
+    discoveryHint.innerHTML = `
+      <div class="hint-title">联网后访问地址</div>
+      <div class="hint-link">http://${escapeHtml(status.hostname)}</div>
+      <div class="hint-note">提交 Wi‑Fi 后，手机切回同一个家庭 Wi‑Fi 再打开这个地址。</div>
+    `;
+  }
+
+  function preconnectHostnameHtml() {
+    return `
+      <div class="preconnect-hostname">
+        联网后访问：<span>http://${escapeHtml(plannedHostname)}</span>
+      </div>
+    `;
+  }
+
+  function renderConnectedPanel(status) {
+    wifiList.innerHTML = `
+      <div class="connected-panel">
+        <div class="connected-title">设备已联网</div>
+        <div class="connected-detail">${connectedStatusHtml(status)}</div>
+        <div class="connected-note">手机需要切回同一个家庭 Wi‑Fi 后访问。</div>
+      </div>
+    `;
+  }
+
+  function connectedStatusHtml(status) {
+    const rows = [];
+    if (status.address) {
+      rows.push(`<div>当前 IP：<a href="http://${escapeHtml(status.address)}">http://${escapeHtml(status.address)}</a></div>`);
+    }
+    if (status.hostname) {
+      rows.push(`<div>推荐地址：<a href="http://${escapeHtml(status.hostname)}">http://${escapeHtml(status.hostname)}</a></div>`);
+    }
+    if (!rows.length) {
+      rows.push('<div>连接成功，正在准备访问地址...</div>');
+    }
+    if (status.discovery && status.discovery.last_error) {
+      rows.push(`<div class="discovery-warning">mDNS 发布失败：${escapeHtml(status.discovery.last_error)}</div>`);
+    }
+    return rows.join('');
   }
 
   function clearStatusTimer() {
@@ -178,5 +245,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   refreshBtn.style.display = 'none';
-  fetchWifiNetworks();
+  fetchInitialStatus().then(connected => {
+    if (!connected) fetchWifiNetworks();
+  });
 });

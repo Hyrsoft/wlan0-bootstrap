@@ -13,7 +13,8 @@
 7. 如果没有可用已知网络，或全部连接失败，进入 Soft AP 配网模式。
 8. 用户通过 Web UI 提交新的 Wi-Fi。
 9. 连接成功后保存到已知网络列表。
-10. 状态通过本地文件和 Unix socket 事件流发布给外部程序。
+10. 联网后发布 mDNS 主机名和 HTTP 服务，便于在局域网重新发现设备。
+11. 状态通过本地文件和 Unix socket 事件流发布给外部程序。
 
 本项目不是完整 NetworkManager 替代品，不支持 AP+STA 并发，不设计双网卡或多后端模式。
 
@@ -63,6 +64,17 @@ wlan0-bootstrap --config /path/to/config.toml
 `status.json` 是当前状态快照。`events.sock` 是 newline-delimited JSON 事件流，供音频、屏幕、LED 等外部程序订阅。
 
 主程序不再直接播放音频或控制提示硬件。
+
+## mDNS 发现
+
+STA 连接成功并获得 IPv4 地址后，程序会继续提供只读状态 API，并通过 mDNS 发布：
+
+- `<hostname>.local`
+- `_http._tcp.local.`
+
+默认 hostname 形如 `wlan-bootstrap-a1b2c3.local`。后缀是首次启动时随机生成的 6 位 ID，并持久化到 `/data/wlan0-bootstrap/device-id`。
+
+mDNS 失败不会影响 Wi-Fi 主连接状态；错误会写入 `status.json` 的 `discovery` 字段，并通过 `events.sock` 发布。
 
 ## Web 配网
 

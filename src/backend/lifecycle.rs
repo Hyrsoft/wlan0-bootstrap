@@ -9,6 +9,7 @@ impl WpaCtrlBackend {
     pub async fn shutdown(&self) {
         // 进程因错误退出或被上层要求停止时，必须清理本程序启动的系统工具。
         // 否则 Buildroot 设备上会留下孤儿 wpa_supplicant/hostapd/dnsmasq，影响下一次配网。
+        self.shutdown_discovery().await;
         let _ = self.stop_ap().await;
 
         let had_wpa_supplicant = if let Some(mut child) = self.wpa_supplicant.lock().await.take() {
@@ -35,6 +36,15 @@ impl WpaCtrlBackend {
         self.collect_device_profile().await?;
         self.ensure_station_daemon().await?;
         Ok(())
+    }
+
+    pub async fn shutdown_discovery(&self) {
+        let mut mdns = self.mdns.lock().await;
+        let hostname = mdns.published_hostname();
+        mdns.shutdown().await;
+        if hostname.is_some() {
+            let _ = self.status.set_mdns_stopped(hostname).await;
+        }
     }
 
     async fn preflight(&self) -> Result<()> {

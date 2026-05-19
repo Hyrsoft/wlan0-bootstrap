@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub ownership: OwnershipConfig,
     #[serde(default)]
     pub platform: PlatformConfig,
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -79,11 +81,34 @@ pub struct PlatformConfig {
     pub ap_mode_reset_delay_ms: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiscoveryConfig {
+    pub mdns_enabled: bool,
+    pub hostname_prefix: String,
+    pub hostname: String,
+    pub http_service_enabled: bool,
+    pub http_service_type: String,
+    pub http_service_name: String,
+}
+
 impl Default for PlatformConfig {
     fn default() -> Self {
         Self {
             auto_driver_quirks: true,
             ap_mode_reset_delay_ms: 600,
+        }
+    }
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            mdns_enabled: true,
+            hostname_prefix: "wlan-bootstrap".to_string(),
+            hostname: String::new(),
+            http_service_enabled: true,
+            http_service_type: "_http._tcp.local.".to_string(),
+            http_service_name: "wlan bootstrap".to_string(),
         }
     }
 }
@@ -201,6 +226,16 @@ impl AppConfig {
                 "timeouts.provisioning_idle_seconds must be greater than zero"
             ));
         }
+        if self.discovery.mdns_enabled && self.discovery.hostname_prefix.trim().is_empty() {
+            return Err(anyhow!("discovery.hostname_prefix must not be empty"));
+        }
+        if self.discovery.http_service_enabled
+            && !self.discovery.http_service_type.ends_with(".local.")
+        {
+            return Err(anyhow!(
+                "discovery.http_service_type must be a fully qualified .local. service type"
+            ));
+        }
         self.bind_addr()?;
         Ok(())
     }
@@ -261,6 +296,14 @@ udhcpc = "udhcpc"
 force_takeover = false
 wpa_group = "netdev"
 wpa_update_config = false
+
+[discovery]
+mdns_enabled = true
+hostname_prefix = "wlan-bootstrap"
+hostname = ""
+http_service_enabled = true
+http_service_type = "_http._tcp.local."
+http_service_name = "wlan bootstrap"
 "#,
         )
         .expect("test config should parse")
@@ -293,5 +336,58 @@ wpa_update_config = false
             config.event_socket_path(),
             PathBuf::from("/run/wlan0-bootstrap/events.sock")
         );
+    }
+
+    #[test]
+    fn discovery_defaults_are_enabled() {
+        let config = AppConfig::load_from_str(
+            r#"
+[interface]
+name = "wlan0"
+
+[paths]
+data_dir = "/data/wlan0-bootstrap"
+run_dir = "/run/wlan0-bootstrap"
+wpa_config = "/run/wlan0-bootstrap/wpa_supplicant.conf"
+wpa_ctrl = "/run/wpa_supplicant"
+hostapd_config = "/run/wlan0-bootstrap/hostapd.conf"
+
+[ap]
+ssid_prefix = "wlan0-bootstrap"
+password = "change-me"
+gateway_cidr = "192.168.4.1/24"
+bind_addr = "192.168.4.1:80"
+dhcp_range = "192.168.4.100,192.168.4.200,12h"
+hw_mode = "g"
+channel = 6
+wpa = 2
+wpa_key_mgmt = "WPA-PSK"
+wpa_pairwise = "CCMP"
+rsn_pairwise = "CCMP"
+
+[timeouts]
+scan_seconds = 10
+connect_seconds = 30
+dhcp_seconds = 20
+provisioning_idle_seconds = 600
+
+[commands]
+wpa_supplicant = "wpa_supplicant"
+hostapd = "hostapd"
+dnsmasq = "dnsmasq"
+ip = "ip"
+udhcpc = "udhcpc"
+
+[ownership]
+force_takeover = false
+wpa_group = "netdev"
+wpa_update_config = false
+"#,
+        )
+        .expect("config without discovery should parse");
+
+        assert!(config.discovery.mdns_enabled);
+        assert_eq!(config.discovery.hostname_prefix, "wlan-bootstrap");
+        assert_eq!(config.discovery.http_service_type, "_http._tcp.local.");
     }
 }

@@ -1,5 +1,6 @@
 mod ap;
 mod dhcp;
+mod discovery;
 mod lifecycle;
 mod provisioning;
 mod scan;
@@ -8,6 +9,7 @@ mod wpa;
 
 use crate::config::AppConfig;
 use crate::device_profile::DeviceProfile;
+use crate::discovery::MdnsPublisher;
 use crate::status::StatusPublisher;
 use crate::structs::Network;
 use std::sync::{Arc, Mutex};
@@ -30,10 +32,12 @@ pub struct WpaCtrlBackend {
     pub(super) cmd_ctrl: Arc<Mutex<Option<WpaController>>>,
     pub(super) device_profile: RwLock<Option<DeviceProfile>>,
     pub(super) scan_cache: RwLock<Vec<Network>>,
+    pub(super) mdns: tokio::sync::Mutex<MdnsPublisher>,
 }
 
 impl WpaCtrlBackend {
     pub fn new(config: Arc<AppConfig>, status: Arc<StatusPublisher>) -> Self {
+        let discovery = config.discovery.clone();
         Self {
             config,
             status,
@@ -43,6 +47,7 @@ impl WpaCtrlBackend {
             cmd_ctrl: Arc::new(Mutex::new(None)),
             device_profile: RwLock::new(None),
             scan_cache: RwLock::new(Vec::new()),
+            mdns: tokio::sync::Mutex::new(MdnsPublisher::new(discovery)),
         }
     }
 

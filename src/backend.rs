@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::device_profile::DeviceProfile;
 use crate::networks::KnownNetwork;
 use crate::status::{ErrorReason, StatusPublisher, WifiState};
 use crate::structs::{ConnectionRequest, Network};
@@ -10,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::fs;
 use tokio::process::{Child, Command};
+use tokio::sync::RwLock;
 use wpa_ctrl::{WpaController, WpaControllerBuilder};
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,7 @@ pub struct WpaCtrlBackend {
     hostapd: tokio::sync::Mutex<Option<Child>>,
     dnsmasq: tokio::sync::Mutex<Option<Child>>,
     cmd_ctrl: Arc<Mutex<Option<WpaController>>>,
+    device_profile: RwLock<Option<DeviceProfile>>,
 }
 
 impl WpaCtrlBackend {
@@ -36,6 +39,7 @@ impl WpaCtrlBackend {
             hostapd: tokio::sync::Mutex::new(None),
             dnsmasq: tokio::sync::Mutex::new(None),
             cmd_ctrl: Arc::new(Mutex::new(None)),
+            device_profile: RwLock::new(None),
         }
     }
 
@@ -69,6 +73,7 @@ impl WpaCtrlBackend {
             .set_state(WifiState::Preflight, None, None)
             .await?;
         self.preflight().await?;
+        self.collect_device_profile().await?;
         self.ensure_station_daemon().await?;
         Ok(())
     }
@@ -117,6 +122,13 @@ impl WpaCtrlBackend {
     pub async fn start_provisioning_ap(&self) -> Result<()> {
         // 单射频设备不能假设 AP+STA 并发可用。
         // 进入配网时先切到 AP 流程，由 hostapd/dnsmasq 提供临时网络。
+        tracing::info!(
+            "starting provisioning AP: interface={} ssid={} bind_addr={} gateway={}",
+            self.config.interface.name,
+            self.config.ap_ssid(),
+            self.config.ap.bind_addr,
+            self.config.ap.gateway_cidr
+        );
         self.set_provisioning_state(WifiState::ProvisioningApStarting, None, None)
             .await?;
         if let Err(err) = self.start_ap().await {
@@ -132,6 +144,22 @@ impl WpaCtrlBackend {
             Some(self.config.ap.bind_addr.clone()),
         )
         .await?;
+        Ok(())
+    }
+
+    async fn collect_device_profile(&self) -> Result<()> {
+        let profile = DeviceProfile::collect(&self.config.interface.name).await;
+        tracing::info!(
+            "device profile: board={:?} compatible={:?} interface={} driver={:?} bus={:?} quirks={:?}",
+            profile.board_model,
+            profile.compatible,
+            profile.interface.name,
+            profile.interface.driver,
+            profile.interface.bus,
+            profile.quirks
+        );
+        self.status.set_device_profile(profile.clone()).await?;
+        *self.device_profile.write().await = Some(profile);
         Ok(())
     }
 
@@ -180,12 +208,28 @@ impl WpaCtrlBackend {
                 None,
             )
             .await?;
+        tracing::info!(
+            "switching from provisioning AP to STA connection: target_ssid={}",
+            request.ssid
+        );
         let _ = self.stop_ap().await;
 
         match self.connect_station(request).await {
-            Ok(info) => Ok(info),
+            Ok(info) => {
+                tracing::info!(
+                    "STA connection succeeded from provisioning: ssid={} ip={:?}",
+                    info.ssid,
+                    info.ip
+                );
+                Ok(info)
+            }
             Err(err) => {
                 let message = err.to_string();
+                tracing::warn!(
+                    "STA connection failed from provisioning: ssid={} error={}; restoring AP",
+                    request.ssid,
+                    message
+                );
                 self.status
                     .set_error(
                         classify_connection_error(&message),
@@ -427,6 +471,26 @@ impl WpaCtrlBackend {
         ))
     }
 
+    async fn set_interface_down(&self) -> Result<()> {
+        let output = Command::new(&self.config.commands.ip)
+            .arg("link")
+            .arg("set")
+            .arg(&self.config.interface.name)
+            .arg("down")
+            .output()
+            .await
+            .context("failed to run ip link set down")?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "failed to set interface down: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
     async fn send_cmd(&self, cmd: &str) -> Result<String> {
         // wpa-ctrl crate 的 request/recv 是阻塞接口。
         // 放到 spawn_blocking 中执行，避免占用 tokio worker 线程。
@@ -481,8 +545,10 @@ impl WpaCtrlBackend {
     async fn start_ap(&self) -> Result<()> {
         // AP/DHCP 仍然调用系统 hostapd 和 dnsmasq。
         // 这里不做内置 AP 或 DHCP server，实现边界保持清晰。
+        tracing::info!("preparing AP services on {}", self.config.interface.name);
         let _ = self.stop_ap().await;
         self.flush_interface_ipv4().await?;
+        self.apply_ap_mode_reset_quirk().await?;
 
         let output = Command::new(&self.config.commands.ip)
             .arg("addr")
@@ -500,6 +566,11 @@ impl WpaCtrlBackend {
                 return Err(anyhow!("failed to assign AP address: {}", stderr));
             }
         }
+        tracing::info!(
+            "assigned AP address {} to {}",
+            self.config.ap.gateway_cidr,
+            self.config.interface.name
+        );
 
         // 这里的 wpa_passphrase 是 hostapd 配置项，表示 Soft AP 的接入密码；
         // 它不是 wpa_passphrase 命令，也不参与 STA 已知网络密码的持久化。
@@ -531,6 +602,12 @@ impl WpaCtrlBackend {
         *self.hostapd.lock().await = Some(hostapd);
         tokio::time::sleep(Duration::from_secs(1)).await;
         self.ensure_child_running(&self.hostapd, "hostapd").await?;
+        tracing::info!(
+            "hostapd started: interface={} ssid={} channel={}",
+            self.config.interface.name,
+            self.config.ap_ssid(),
+            self.config.ap.channel
+        );
 
         let ap_ip = self
             .config
@@ -540,8 +617,16 @@ impl WpaCtrlBackend {
             .map(|(ip, _)| ip)
             .unwrap_or(self.config.ap.gateway_cidr.as_str());
         let dnsmasq = Command::new(&self.config.commands.dnsmasq)
+            // 目标设备可能已经在 usb0 等调试网口上运行 DHCP 服务。
+            // dnsmasq 必须限制在本程序管理的 Wi-Fi 接口和 AP 网关地址上，
+            // 避免绑定 0.0.0.0:67 时和系统已有 DHCP 服务冲突。
             .arg(format!("--interface={}", self.config.interface.name))
-            .arg(format!("--dhcp-range={}", self.config.ap.dhcp_range))
+            .arg("--bind-interfaces")
+            .arg(format!("--listen-address={}", ap_ip))
+            .arg(format!(
+                "--dhcp-range={}",
+                format_dnsmasq_dhcp_range(&self.config.interface.name, &self.config.ap.dhcp_range)
+            ))
             .arg(format!("--address=/#/{}", ap_ip))
             .arg("--no-resolv")
             .arg("--no-hosts")
@@ -551,7 +636,48 @@ impl WpaCtrlBackend {
         *self.dnsmasq.lock().await = Some(dnsmasq);
         tokio::time::sleep(Duration::from_millis(300)).await;
         self.ensure_child_running(&self.dnsmasq, "dnsmasq").await?;
+        tracing::info!(
+            "dnsmasq started: interface={} listen_address={} dhcp_range={}",
+            self.config.interface.name,
+            ap_ip,
+            format_dnsmasq_dhcp_range(&self.config.interface.name, &self.config.ap.dhcp_range)
+        );
 
+        Ok(())
+    }
+
+    async fn apply_ap_mode_reset_quirk(&self) -> Result<()> {
+        if !self.config.platform.auto_driver_quirks {
+            return Ok(());
+        }
+
+        let profile = self.device_profile.read().await.clone();
+        let Some(profile) = profile else {
+            return Ok(());
+        };
+
+        if !profile.has_quirk("rockchip_bcmdhd_ap_mode_reset") {
+            return Ok(());
+        }
+
+        // RK + Broadcom bcmdhd 在 AP->STA 失败->AP 的快速切换中，
+        // 可能保留上一次 AP beacon/security 状态，导致 hostapd 第二次启动时报
+        // "Failed to set beacon parameters" 或 rsn_cap_value error。
+        // 这里仅对自动识别出的 bcmdhd 设备做接口 down/up 复位，不影响其他平台。
+        tracing::info!(
+            "applying platform quirk rockchip_bcmdhd_ap_mode_reset on {}",
+            self.config.interface.name
+        );
+        self.set_interface_down().await?;
+        tokio::time::sleep(Duration::from_millis(
+            self.config.platform.ap_mode_reset_delay_ms,
+        ))
+        .await;
+        self.set_interface_up().await?;
+        tokio::time::sleep(Duration::from_millis(
+            self.config.platform.ap_mode_reset_delay_ms,
+        ))
+        .await;
         Ok(())
     }
 
@@ -609,9 +735,11 @@ impl WpaCtrlBackend {
 
     async fn stop_ap(&self) -> Result<()> {
         if let Some(mut child) = self.dnsmasq.lock().await.take() {
+            tracing::info!("stopping dnsmasq for provisioning AP");
             let _ = child.kill().await;
         }
         if let Some(mut child) = self.hostapd.lock().await.take() {
+            tracing::info!("stopping hostapd for provisioning AP");
             let _ = child.kill().await;
         }
 
@@ -630,6 +758,12 @@ impl WpaCtrlBackend {
             if !stderr.contains("Cannot assign requested address") {
                 return Err(anyhow!("failed to remove AP address: {}", stderr));
             }
+        } else {
+            tracing::info!(
+                "removed AP address {} from {}",
+                self.config.ap.gateway_cidr,
+                self.config.interface.name
+            );
         }
 
         match fs::remove_file(&self.config.paths.hostapd_config).await {
@@ -648,12 +782,29 @@ impl WpaCtrlBackend {
     async fn connect_station(&self, request: &ConnectionRequest) -> Result<ConnectedInfo> {
         // 连接动作全部通过 wpa_supplicant 控制接口完成。
         // request.password 可能是明文密码，也可能是历史数据中的 64 位 raw PSK。
+        tracing::info!("creating wpa_supplicant network: ssid={}", request.ssid);
         let net_id = self.add_network().await?;
+        tracing::info!(
+            "configuring wpa_supplicant network: ssid={} net_id={}",
+            request.ssid,
+            net_id
+        );
         let result = self.configure_and_enable_network(net_id, request).await;
         if let Err(err) = result {
+            tracing::warn!(
+                "failed to configure wpa_supplicant network: ssid={} net_id={} error={}",
+                request.ssid,
+                net_id,
+                err
+            );
             let _ = self.send_cmd(&format!("REMOVE_NETWORK {}", net_id)).await;
             return Err(err);
         }
+        tracing::info!(
+            "enabled wpa_supplicant network: ssid={} net_id={}",
+            request.ssid,
+            net_id
+        );
 
         let connected = match self.wait_for_connection(request, net_id).await {
             Ok(connected) => connected,
@@ -700,6 +851,10 @@ impl WpaCtrlBackend {
             self.send_cmd(&format!("SET_NETWORK {} key_mgmt NONE", net_id))
                 .await?;
         } else {
+            // 手动验证表明 RK3576/bcmdhd 上显式设置 key_mgmt 更稳定。
+            // 只设置 psk 时，部分驱动/固件组合会在 ASSOCIATING 后直接 DISCONNECTED。
+            self.send_cmd(&format!("SET_NETWORK {} key_mgmt WPA-PSK", net_id))
+                .await?;
             self.send_cmd(&format!(
                 "SET_NETWORK {} psk {}",
                 net_id,
@@ -719,17 +874,55 @@ impl WpaCtrlBackend {
     ) -> Result<ConnectedInfo> {
         let started = tokio::time::Instant::now();
         let timeout = Duration::from_secs(self.config.timeouts.connect_seconds);
+        let mut last_state = String::new();
+        tracing::info!(
+            "waiting for STA association: ssid={} net_id={} timeout={}s",
+            request.ssid,
+            net_id,
+            self.config.timeouts.connect_seconds
+        );
 
         loop {
             if started.elapsed() > timeout {
+                tracing::warn!(
+                    "STA association timed out: ssid={} net_id={} elapsed={}s",
+                    request.ssid,
+                    net_id,
+                    started.elapsed().as_secs()
+                );
                 let _ = self.send_cmd(&format!("REMOVE_NETWORK {}", net_id)).await;
                 return Err(anyhow!("association_timeout"));
             }
 
             tokio::time::sleep(Duration::from_secs(2)).await;
             let status = self.send_cmd("STATUS").await?;
-            match parse_wpa_state(&status) {
+            let wpa_state = parse_wpa_state(&status).unwrap_or("UNKNOWN");
+            if wpa_state != last_state {
+                last_state = wpa_state.to_string();
+                tracing::info!(
+                    "wpa_supplicant state changed: ssid={} net_id={} state={} bssid={:?} ip={:?}",
+                    request.ssid,
+                    net_id,
+                    wpa_state,
+                    wpa_status_field(&status, "bssid"),
+                    wpa_status_field(&status, "ip_address")
+                );
+            } else {
+                tracing::debug!(
+                    "wpa_supplicant state polling: ssid={} net_id={} state={} elapsed={}s",
+                    request.ssid,
+                    net_id,
+                    wpa_state,
+                    started.elapsed().as_secs()
+                );
+            }
+
+            match Some(wpa_state) {
                 Some("COMPLETED") => {
+                    tracing::info!(
+                        "STA association completed; starting DHCP: ssid={}",
+                        request.ssid
+                    );
                     let ip = self.run_dhcp().await?;
                     return Ok(ConnectedInfo {
                         ssid: request.ssid.clone(),
@@ -744,6 +937,13 @@ impl WpaCtrlBackend {
                 Some("DISCONNECTED") | Some("INACTIVE") | Some("INTERFACE_DISABLED")
                     if started.elapsed() > Duration::from_secs(5) =>
                 {
+                    tracing::warn!(
+                        "STA connection failed before DHCP: ssid={} net_id={} state={} elapsed={}s",
+                        request.ssid,
+                        net_id,
+                        wpa_state,
+                        started.elapsed().as_secs()
+                    );
                     let _ = self.send_cmd(&format!("REMOVE_NETWORK {}", net_id)).await;
                     return Err(anyhow!("network_not_found_or_wrong_password"));
                 }
@@ -753,6 +953,10 @@ impl WpaCtrlBackend {
     }
 
     async fn run_dhcp(&self) -> Result<Option<String>> {
+        tracing::info!(
+            "starting DHCP client: interface={}",
+            self.config.interface.name
+        );
         let mut child = Command::new(&self.config.commands.udhcpc)
             .arg("-i")
             .arg(&self.config.interface.name)
@@ -770,15 +974,31 @@ impl WpaCtrlBackend {
             Ok(result) => result.context("failed to wait for udhcpc")?,
             Err(_) => {
                 let _ = child.kill().await;
+                tracing::warn!(
+                    "DHCP timed out: interface={} timeout={}s",
+                    self.config.interface.name,
+                    self.config.timeouts.dhcp_seconds
+                );
                 return Err(anyhow!("dhcp_timeout"));
             }
         };
 
         if !status.success() {
+            tracing::warn!(
+                "DHCP failed: interface={} status={}",
+                self.config.interface.name,
+                status
+            );
             return Err(anyhow!("dhcp_failed"));
         }
 
-        self.read_interface_ipv4().await
+        let ip = self.read_interface_ipv4().await?;
+        tracing::info!(
+            "DHCP completed: interface={} ip={:?}",
+            self.config.interface.name,
+            ip
+        );
+        Ok(ip)
     }
 
     async fn read_interface_ipv4(&self) -> Result<Option<String>> {
@@ -847,9 +1067,13 @@ fn parse_scan_results(output: &str) -> Vec<Network> {
 }
 
 fn parse_wpa_state(status: &str) -> Option<&str> {
+    wpa_status_field(status, "wpa_state")
+}
+
+fn wpa_status_field<'a>(status: &'a str, name: &str) -> Option<&'a str> {
     status.lines().find_map(|line| {
         let (key, value) = line.split_once('=')?;
-        (key == "wpa_state").then_some(value)
+        (key == name).then_some(value)
     })
 }
 
@@ -941,6 +1165,14 @@ fn parse_ipv4_addr(output: &str) -> Option<String> {
     None
 }
 
+fn format_dnsmasq_dhcp_range(iface: &str, range: &str) -> String {
+    if range.starts_with("interface:") {
+        range.to_string()
+    } else {
+        format!("interface:{},{}", iface, range)
+    }
+}
+
 fn find_interface_owner<'a>(process_list: &'a str, iface: &str) -> Option<&'a str> {
     process_list.lines().find(|line| {
         is_wpa_supplicant_for_iface(line, iface)
@@ -1006,6 +1238,18 @@ bssid / frequency / signal level / flags / ssid
 
         assert_eq!(format_wpa_psk(raw), raw);
         assert_eq!(format_wpa_psk("plain\"pass"), "\"plain\\\"pass\"");
+    }
+
+    #[test]
+    fn format_dnsmasq_dhcp_range_binds_range_to_interface() {
+        assert_eq!(
+            format_dnsmasq_dhcp_range("wlan0", "192.168.4.100,192.168.4.200,12h"),
+            "interface:wlan0,192.168.4.100,192.168.4.200,12h"
+        );
+        assert_eq!(
+            format_dnsmasq_dhcp_range("wlan0", "interface:wlan1,10.0.0.10,10.0.0.20,1h"),
+            "interface:wlan1,10.0.0.10,10.0.0.20,1h"
+        );
     }
 
     #[test]

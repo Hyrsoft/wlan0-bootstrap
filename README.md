@@ -97,6 +97,7 @@ cross build \
 - [docs/REFACTOR_BLUEPRINT.md](docs/REFACTOR_BLUEPRINT.md)：重构蓝图。
 - [docs/RUST_CODE_STYLE.md](docs/RUST_CODE_STYLE.md)：Rust 代码规范。
 - [docs/DEVICE_TEST_FLOW.md](docs/DEVICE_TEST_FLOW.md)：真实 Buildroot 设备测试流程。
+- [docs/MDNS_DISCOVERY_BLUEPRINT.md](docs/MDNS_DISCOVERY_BLUEPRINT.md)：mDNS 设备发现功能蓝图。
 
 ## 验证
 

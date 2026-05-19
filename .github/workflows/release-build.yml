@@ -21,6 +21,9 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             asset_suffix: armv7-musleabihf
             env_rustflags: "-C target-feature=+crt-static"
+          - target: aarch64-unknown-linux-musl
+            asset_suffix: aarch64-musl
+            env_rustflags: "-C target-feature=+crt-static"
 
     steps:
       - name: "1. Checkout Repository"

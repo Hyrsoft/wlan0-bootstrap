@@ -103,6 +103,10 @@ pub async fn run_server(
 async fn api_scan(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // 返回进入 AP 前的扫描缓存。
     // 单射频设备此时正在提供 Soft AP，不在这里重新触发 STA 扫描。
+    tracing::info!(
+        "web api scan requested; returning {} cached networks",
+        state.scanned_networks.len()
+    );
     (StatusCode::OK, Json(state.scanned_networks.clone()))
 }
 
@@ -123,11 +127,16 @@ async fn api_connect(
 ) -> impl IntoResponse {
     // /api/connect 只表示请求已接收。
     // 真实连接结果通过 /api/status 轮询，避免 HTTP 请求长时间挂起。
+    tracing::info!("web api connect requested: ssid={}", payload.ssid);
     if state
         .connect_in_progress
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
+        tracing::warn!(
+            "web api connect rejected because another attempt is running: ssid={}",
+            payload.ssid
+        );
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -140,12 +149,14 @@ async fn api_connect(
 
     let state_for_task = state.clone();
     tokio::spawn(async move {
+        tracing::info!("provisioning connect task started: ssid={}", payload.ssid);
         let result = state_for_task
             .backend
             .connect_from_provisioning(&payload)
             .await;
 
         if result.is_ok() {
+            tracing::info!("provisioning connect task succeeded: ssid={}", payload.ssid);
             {
                 // 当前阶段不调用额外派生工具，也不在程序内实现 PSK 派生。
                 // 连接成功后保存用户提交的密码字符串，后续自动连接继续交给 wpa_supplicant 处理。
@@ -159,6 +170,12 @@ async fn api_connect(
             if let Some(sender) = state_for_task.shutdown.lock().await.take() {
                 let _ = sender.send(());
             }
+        } else if let Err(err) = &result {
+            tracing::warn!(
+                "provisioning connect task failed: ssid={} error={}",
+                payload.ssid,
+                err
+            );
         }
 
         state_for_task

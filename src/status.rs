@@ -1,3 +1,4 @@
+use crate::device_profile::DeviceProfile;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -52,6 +53,7 @@ pub struct StatusSnapshot {
     pub ssid: Option<String>,
     pub address: Option<String>,
     pub last_error: Option<StatusError>,
+    pub device: Option<DeviceProfile>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,6 +101,7 @@ impl StatusPublisher {
                 ssid: None,
                 address: None,
                 last_error: None,
+                device: None,
             }),
             status_path,
             event_socket_path,
@@ -160,6 +163,13 @@ impl StatusPublisher {
 
     pub async fn snapshot(&self) -> StatusSnapshot {
         self.snapshot.read().await.clone()
+    }
+
+    pub async fn set_device_profile(&self, device: DeviceProfile) -> Result<()> {
+        // 设备画像用于 Web/API 诊断，也用于后续平台 quirk 判断。
+        // 它只描述启动时观察到的硬件和驱动，不代表业务连接状态。
+        self.snapshot.write().await.device = Some(device);
+        self.write_snapshot().await
     }
 
     pub async fn set_state(

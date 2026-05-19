@@ -38,3 +38,7 @@ udhcpc = "udhcpc"
 force_takeover = false
 wpa_group = "netdev"
 wpa_update_config = false
+
+[platform]
+auto_driver_quirks = true
+ap_mode_reset_delay_ms = 600

@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub timeouts: TimeoutConfig,
     pub commands: CommandConfig,
     pub ownership: OwnershipConfig,
+    #[serde(default)]
+    pub platform: PlatformConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -69,6 +71,21 @@ pub struct OwnershipConfig {
     pub force_takeover: bool,
     pub wpa_group: String,
     pub wpa_update_config: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlatformConfig {
+    pub auto_driver_quirks: bool,
+    pub ap_mode_reset_delay_ms: u64,
+}
+
+impl Default for PlatformConfig {
+    fn default() -> Self {
+        Self {
+            auto_driver_quirks: true,
+            ap_mode_reset_delay_ms: 600,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

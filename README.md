@@ -104,3 +104,7 @@ cross build \
 cargo check
 cargo clippy -- -D warnings
 ```
+
+## License
+
+MIT

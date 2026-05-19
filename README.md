@@ -98,6 +98,7 @@ cross build \
 - [docs/RUST_CODE_STYLE.md](docs/RUST_CODE_STYLE.md)：Rust 代码规范。
 - [docs/DEVICE_TEST_FLOW.md](docs/DEVICE_TEST_FLOW.md)：真实 Buildroot 设备测试流程。
 - [docs/MDNS_DISCOVERY_BLUEPRINT.md](docs/MDNS_DISCOVERY_BLUEPRINT.md)：mDNS 设备发现功能蓝图。
+- [docs/BROADCOM_BCMDHD_NOTES.md](docs/BROADCOM_BCMDHD_NOTES.md)：RK + Broadcom bcmdhd 模式切换问题说明。
 
 ## 验证
 

@@ -1,0 +1,10 @@
+config BR2_PACKAGE_WLAN0_BOOTSTRAP
+	bool "wlan0-bootstrap"
+	depends on BR2_PACKAGE_HOSTAPD
+	depends on BR2_PACKAGE_WPA_SUPPLICANT
+	depends on BR2_PACKAGE_DNSMASQ
+	select BR2_PACKAGE_BUSYBOX
+	help
+	  Lightweight wlan0 bootstrap daemon for single-radio Buildroot
+	  AIoT devices. It connects known Wi-Fi networks first and falls
+	  back to Soft AP web provisioning when no known network is usable.

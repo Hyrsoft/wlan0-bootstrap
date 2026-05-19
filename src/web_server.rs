@@ -1,164 +1,221 @@
 use crate::backend::WpaCtrlBackend;
 use crate::embed::EmbedFrontend;
-use crate::structs::{ConnectionRequest, Network};
+use crate::networks::{KnownNetworks, NetworkStore};
+use crate::status::StatusPublisher;
+use crate::structs::{ConnectAccepted, ConnectionRequest};
 use crate::traits::UiAssetProvider;
+use anyhow::Context;
 use axum::{
+    Router,
     body::Body,
     extract::State,
-    http::{header, StatusCode, Uri},
+    http::{StatusCode, Uri, header},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
-    Router,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::net::TcpListener;
+use tokio::sync::{Mutex, oneshot};
 
-/// Web 服务器状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisioningExit {
+    Connected,
+    IdleTimeout,
+}
+
 struct AppState {
     backend: Arc<WpaCtrlBackend>,
-    // TDM 模式：缓存启动时扫描的网络列表
-    initial_networks: Arc<Mutex<Vec<Network>>>,
-    // UI 资产提供器
+    status: Arc<StatusPublisher>,
+    known_networks: Arc<Mutex<KnownNetworks>>,
+    store: NetworkStore,
     ui_provider: Arc<dyn UiAssetProvider>,
+    connect_in_progress: AtomicBool,
+    shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
 
-/// 启动 Web 服务器（TDM 模式）
 pub async fn run_server(
     backend: Arc<WpaCtrlBackend>,
-    initial_networks: Vec<Network>,
-) -> anyhow::Result<()> {
-    // 初始化 EmbedFrontend
-    let ui_provider = Arc::new(EmbedFrontend::new());
-
+    status: Arc<StatusPublisher>,
+    known_networks: Arc<Mutex<KnownNetworks>>,
+    store: NetworkStore,
+) -> anyhow::Result<ProvisioningExit> {
+    // Web 服务只在配网窗口内运行。
+    // 连接成功或空闲超时都会触发 graceful shutdown，把控制权交还给主循环。
+    let (connected_tx, connected_rx) = oneshot::channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
     let app_state = Arc::new(AppState {
         backend: backend.clone(),
-        initial_networks: Arc::new(Mutex::new(initial_networks)),
-        ui_provider,
+        status,
+        known_networks,
+        store,
+        ui_provider: Arc::new(EmbedFrontend::new()),
+        connect_in_progress: AtomicBool::new(false),
+        shutdown: Mutex::new(Some(connected_tx)),
     });
 
-    // 构建路由
     let app = Router::new()
-        .route("/api/scan", get(api_scan_tdm))
-        .route("/api/connect", post(api_connect_tdm))
-        .route("/api/backend_kind", get(api_backend_kind_tdm))
+        .route("/api/scan", get(api_scan))
+        .route("/api/status", get(api_status))
+        .route("/api/connect", post(api_connect))
+        .route("/api/backend_kind", get(api_backend_kind))
         .route("/generate_204", get(handle_captive_portal))
         .fallback(get(serve_static_asset))
-        .with_state(app_state.clone());
+        .with_state(app_state);
 
-    let bind_addr = backend.ap_config().bind_addr;
-    tracing::info!("🌐 TDM Web server listening on {}", bind_addr);
+    let bind_addr = backend.config().bind_addr()?;
+    tracing::info!("provisioning web server listening on {}", bind_addr);
 
     let listener = TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+    });
 
-    Ok(())
+    let idle_timeout = tokio::time::sleep(std::time::Duration::from_secs(
+        backend.config().timeouts.provisioning_idle_seconds,
+    ));
+
+    let exit = tokio::select! {
+        result = &mut server => {
+            result.context("provisioning web server task failed")??;
+            return Ok(ProvisioningExit::Connected);
+        }
+        _ = connected_rx => ProvisioningExit::Connected,
+        _ = idle_timeout => ProvisioningExit::IdleTimeout,
+    };
+
+    let _ = stop_tx.send(());
+    server
+        .await
+        .context("provisioning web server task failed")??;
+    Ok(exit)
 }
 
-/// 返回缓存的扫描结果（TDM 模式）
-async fn api_scan_tdm(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    tracing::debug!("Handling /api/scan (TDM): returning cached list");
-    let networks = state.initial_networks.lock().unwrap().clone();
-    (StatusCode::OK, Json(networks)).into_response()
+async fn api_scan(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // 返回 backend 维护的扫描缓存。
+    // 单射频设备此时正在提供 Soft AP，不在这里重新触发 STA 扫描。
+    let networks = state.backend.cached_networks().await;
+    tracing::info!(
+        "web api scan requested; returning {} cached networks",
+        networks.len()
+    );
+    (StatusCode::OK, Json(networks))
 }
 
-/// 返回后端类型
-async fn api_backend_kind_tdm() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({ "kind": "tdm" }))).into_response()
+async fn api_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (StatusCode::OK, Json(state.status.snapshot().await))
 }
 
-/// 处理连接请求（TDM 模式）
-/// 使用"发送并忘记"(Fire and Forget) 模式：
-/// 立即返回 200 OK，然后在后台执行实际的连接工作。
-/// 这避免了竞争条件：浏览器因为 AP 被关闭而无法接收响应。
-async fn api_connect_tdm(
+async fn api_backend_kind() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "kind": "single_radio_tdm" })),
+    )
+}
+
+async fn api_connect(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ConnectionRequest>,
 ) -> impl IntoResponse {
-    tracing::debug!(ssid = %payload.ssid, "Handling /api/connect request (TDM)");
+    // /api/connect 只表示请求已接收。
+    // 真实连接结果通过 /api/status 轮询，避免 HTTP 请求长时间挂起。
+    tracing::info!("web api connect requested: ssid={}", payload.ssid);
+    if state
+        .connect_in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        tracing::warn!(
+            "web api connect rejected because another attempt is running: ssid={}",
+            payload.ssid
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "busy",
+                "message": "connection attempt already in progress"
+            })),
+        )
+            .into_response();
+    }
 
-    // 克隆 backend Arc 以在后台任务中使用
-    let backend_clone = state.backend.clone();
-
-    // 生成后台任务来执行实际的连接工作
+    let state_for_task = state.clone();
     tokio::spawn(async move {
-        // connect 函数在后台运行，它包含：
-        // 1. 停止 AP
-        // 2. 连接到目标网络
-        // 3. 运行 DHCP 获取 IP
-        // 4. 成功时调用 std::process::exit(0)
-        // 5. 失败时重启 AP 并返回 Err
-        if let Err(e) = backend_clone.connect(&payload).await {
-            // 如果连接失败，connect 函数会自己重启 AP
-            // 我们只需要记录错误，不需要退出程序
-            // 这样用户可以重新连接 AP 并重试
-            tracing::error!(
-                "Connection failed: {}. AP should have been restarted automatically.",
-                e
+        tracing::info!("provisioning connect task started: ssid={}", payload.ssid);
+        let result = state_for_task
+            .backend
+            .connect_from_provisioning(&payload)
+            .await;
+
+        if result.is_ok() {
+            tracing::info!("provisioning connect task succeeded: ssid={}", payload.ssid);
+            {
+                // 当前阶段不调用额外派生工具，也不在程序内实现 PSK 派生。
+                // 连接成功后保存用户提交的密码字符串，后续自动连接继续交给 wpa_supplicant 处理。
+                let mut guard = state_for_task.known_networks.lock().await;
+                guard.upsert_success(&payload);
+                if let Err(err) = state_for_task.store.save(&guard).await {
+                    tracing::error!("failed to save known networks: {}", err);
+                }
+            }
+
+            if let Some(sender) = state_for_task.shutdown.lock().await.take() {
+                let _ = sender.send(());
+            }
+        } else if let Err(err) = &result {
+            tracing::warn!(
+                "provisioning connect task failed: ssid={} error={}",
+                payload.ssid,
+                err
             );
-            // 移除了 std::process::exit(1)，让程序继续运行
-            // Web 服务器会继续接受用户的下一次尝试
         }
+
+        state_for_task
+            .connect_in_progress
+            .store(false, Ordering::SeqCst);
     });
 
-    // 立即返回 200 OK，在 AP 关闭之前发送给浏览器
-    // 这样用户就能在手机上看到成功提示，即使设备随后断开 Wi-Fi
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "success",
-            "message": "Connection request received. Device is now switching networks."
-        })),
+        Json(ConnectAccepted {
+            status: "accepted",
+            message: "connection request accepted",
+        }),
     )
         .into_response()
 }
 
-/// 处理捕获门户检测请求（Captive Portal Detection）
-/// 
-/// 现代智能手机（Android、iOS）在连接到 Wi-Fi 后，会尝试访问已知的
-/// 互联网检验 URL（如 connectivitycheck.gstatic.com/generate_204）来确认
-/// 是否真的有互联网连接。
-///
-/// 我们的 dnsmasq 会劫持这个 DNS 请求并将其指向 192.168.4.1。
-/// 这个处理器以静默方式响应它，避免不必要的日志警告。
 async fn handle_captive_portal() -> impl IntoResponse {
     (StatusCode::NO_CONTENT, "")
 }
 
-/// 处理静态资产的 Fallback 处理器
-///
-/// 这个处理器会捕获所有未被 API 路由匹配的 GET 请求，
-/// 并尝试从 `UiAssetProvider` (即 EmbedFrontend) 中服务文件。
-async fn serve_static_asset(
-    State(state): State<Arc<AppState>>,
-    uri: Uri,
-) -> impl IntoResponse {
+async fn serve_static_asset(State(state): State<Arc<AppState>>, uri: Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/').to_string();
-
-    // 如果路径为空 (即请求根目录 "/"), 则服务 "index.html"
     if path.is_empty() {
         path = "index.html".to_string();
     }
 
-    // 尝试从嵌入式资产中获取文件
     match state.ui_provider.get_asset(&path).await {
-        Ok((data, mime)) => {
-            // 成功：返回文件数据和正确的 Mime 类型
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime)
-                .body(Body::from(data))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response").into_response()
-                })
-        }
-        Err(e) => {
-            // 失败 (例如 404 Not Found)
-            tracing::warn!("Failed to get asset: {} (Error: {})", path, e);
-            // 对于 SPA (单页应用) 来说，
-            // 更好的做法可能是在找不到文件时重定向回 index.html。
-            // 但对于这个简单的 UI，返回 404 是清晰且正确的。
+        Ok((data, mime)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime)
+            .body(Body::from(data))
+            .unwrap_or_else(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to build response",
+                )
+                    .into_response()
+            }),
+        Err(err) => {
+            tracing::warn!("asset not found {}: {}", path, err);
             (StatusCode::NOT_FOUND, "Not Found").into_response()
         }
     }
 }
-

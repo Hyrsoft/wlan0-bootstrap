@@ -426,27 +426,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "provisioner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "hex",
- "mime_guess",
- "once_cell",
- "rust-embed",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "wpa-ctrl",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -992,6 +971,27 @@ name = "winnow"
 version = "0.7.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21a0236b59786fed61e2a80582dd500fe61f18b5dca67a4a067d0bc9039339cf"
+
+[[package]]
+name = "wlan0-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "hex",
+ "mime_guess",
+ "once_cell",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "wpa-ctrl",
+]
 
 [[package]]
 name = "wpa-ctrl"

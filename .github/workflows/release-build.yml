@@ -1,4 +1,4 @@
-name: "🚀 Cross-Platform Release Build"
+name: "Release Build"
 
 on:
   push:
@@ -19,18 +19,11 @@ jobs:
       matrix:
         include:
           - target: armv7-unknown-linux-musleabihf
-            asset_suffix: echo-mate-armv7-musleabihf
+            asset_suffix: armv7-musleabihf
             env_rustflags: "-C target-feature=+crt-static"
-
-          - target: armv7-unknown-linux-musleabihf
-            asset_suffix: echo-mate-audio-armv7-musleabihf
-            features: "audio"
+          - target: aarch64-unknown-linux-musl
+            asset_suffix: aarch64-musl
             env_rustflags: "-C target-feature=+crt-static"
-
-          # - target: armv7-unknown-linux-musleabihf
-          #   asset_suffix: wpa_cli-dnsmasq-armv7-musleabihf
-          #   features: "provisioner-daemon/backend_wpa_cli_exclusive,provisioner-daemon/ui_echo_mate"
-          #   env_rustflags: "-C target-feature=+crt-static"
 
     steps:
       - name: "1. Checkout Repository"
@@ -55,15 +48,11 @@ jobs:
       - name: "5. Build Static Binary"
         id: build
         env:
-          PROGRAM_NAME: "provisioner"
+          PROGRAM_NAME: "wlan0-bootstrap"
         run: |
           BUILD_COMMAND="cross build --target=${{ matrix.target }} --release"
-          if [ -n "${{ matrix.features }}" ]; then
-            BUILD_COMMAND="$BUILD_COMMAND --features \"${{ matrix.features }}\""
-          fi
-
           echo "Running: $BUILD_COMMAND"
-          eval $BUILD_COMMAND
+          $BUILD_COMMAND
           
           SOURCE_PATH="target/${{ matrix.target }}/release/${PROGRAM_NAME}"
           DEST_NAME="${PROGRAM_NAME}-${{ matrix.asset_suffix }}"
@@ -110,45 +99,26 @@ jobs:
           # 不指定 name，会下载所有 Artifacts
           path: artifacts # 下载到 'artifacts' 文件夹
 
-      - name: "3. Create Release, Package UI, and Upload All Assets"
+      - name: "3. Create Release and Upload Assets"
         env:
-          # GITHUB_TOKEN 是自动由 GitHub Actions 提供的
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. 准备 UI 压缩包
-          UI_ASSET_NAME="ui-assets-${{ github.ref_name }}.tar.gz"
-          echo "📦 Packaging UI folder into $UI_ASSET_NAME"
-          tar -czf $UI_ASSET_NAME -C . ui
-          
-          # 2. 构建产物列表（UI + 二进制文件）
-          declare -a ASSET_LIST=("$UI_ASSET_NAME")
-          
-          echo "📥 Found artifacts:"
+          echo "Found artifacts:"
           find artifacts -type f | while read asset_path; do
             asset_name=$(basename "$asset_path")
             echo "  - $asset_name"
-            ASSET_LIST+=("$asset_path")
           done
           
-          # 3. 一次性创建 Release 并上传所有产物
-          # --generate-notes: 自动基于 PR 生成 Release Notes
-          # --title: 指定 Release 标题
-          echo ""
-          echo "🚀 Creating Release ${{ github.ref_name }} with auto-generated notes..."
+          echo "Creating Release ${{ github.ref_name }} with auto-generated notes..."
           
-          # 这里我们需要构建完整的文件列表作为参数
-          # 方式：先创建数组，再展开
           gh release create \
             "${{ github.ref_name }}" \
             --title "Release ${{ github.ref_name }}" \
             --generate-notes \
-            "$UI_ASSET_NAME" \
             $(find artifacts -type f)
           
-          echo ""
-          echo "✅ Release created successfully!"
-          echo "📤 Assets uploaded:"
-          echo "  - UI assets: $UI_ASSET_NAME"
+          echo "Release created successfully."
+          echo "Assets uploaded:"
           find artifacts -type f | while read asset_path; do
             asset_name=$(basename "$asset_path")
             echo "  - Binary: $asset_name"

@@ -1,18 +1,22 @@
-<svg width="750" height="750" xmlns="http://www.w3.org/2000/svg">
- <defs>
-  <filter id="_blur">
-   <feGaussianBlur stdDeviation="0" in="SourceGraphic"/>
-  </filter>
- </defs>
- <g>
-  <title>Layer 1</title>
-  <ellipse stroke-width="0" ry="250" rx="250" id="svg_3" cy="375.00001" cx="375" stroke="#000" fill="#ffffff"/>
-  <g stroke="null" filter="url(#_blur)">
-   <path stroke="null" p-id="4622" fill="#66B2F6" d="m507.61788,549.31112l-204.49185,0l0,-34.20233l187.47422,0l0,-234.0117c-21.30207,-36.94497 -48.41015,-54.97379 -82.7257,-55.09479l-0.32033,0c-35.0363,0 -64.06637,18.83548 -88.65184,57.51477l-68.99148,259.09879l-32.79397,-8.87325l69.63214,-261.59943c0.44046,-1.65365 1.12116,-3.1863 2.00207,-4.63829c31.15227,-50.21451 71.11367,-75.70492 118.76304,-75.70492l0.44046,0c48.20995,0.16133 86.72985,25.89375 114.51864,76.51158c1.40145,2.54098 2.1222,5.36428 2.1222,8.26825l0,255.63015c0,9.43791 -7.60788,17.10117 -16.97759,17.10117z"/>
-   <path stroke="null" p-id="4623" fill="#7EDBFE" d="m403.34986,311.54845m-16.97759,0a16.97759,17.10117 0 1 0 33.95518,0a16.97759,17.10117 0 1 0 -33.95518,0z"/>
-   <path stroke="null" p-id="4624" fill="#7BF2FC" d="m267.44906,294.44729c-28.10912,0 -50.93277,-23.03011 -50.93277,-51.3035s22.86369,-51.34383 50.93277,-51.34383s50.97281,23.03011 50.97281,51.3035s-22.86369,51.34383 -50.97281,51.34383zm0,-68.44499c-9.36971,0 -16.97759,7.66326 -16.97759,17.10117s7.60788,17.10117 16.97759,17.10117s16.97759,-7.66326 16.97759,-17.10117s-7.60788,-17.10117 -16.97759,-17.10117z"/>
-   <path stroke="null" p-id="4625" fill="#7BF2FC" d="m233.49388,379.95312c-28.10912,0 -50.93277,-23.03011 -50.93277,-51.3035s22.82365,-51.3035 50.93277,-51.3035s50.97281,22.98977 50.97281,51.3035s-22.86369,51.3035 -50.97281,51.3035zm0,-68.40466c-9.36971,0 -16.97759,7.66326 -16.97759,17.10117s7.60788,17.10117 16.97759,17.10117s16.97759,-7.66326 16.97759,-17.10117s-7.60788,-17.10117 -16.97759,-17.10117z"/>
-   <path stroke="null" p-id="4626" fill="#66B2F6" d="m505.25543,243.10346l35.5168,0l0,34.20233l-35.5168,0l0,-34.20233z"/>
-  </g>
- </g>
+<svg width="96" height="96" viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">wlan bootstrap</title>
+  <desc id="desc">A wlan0 bootstrap logo with Wi-Fi arcs and a device uplink mark.</desc>
+  <defs>
+    <linearGradient id="bg" x1="18" y1="8" x2="78" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0ea5e9"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="31" y1="22" x2="66" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ecfeff"/>
+      <stop offset="1" stop-color="#bfdbfe"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="84" height="84" rx="20" fill="url(#bg)"/>
+  <path d="M29 41c10.7-9.5 27.3-9.5 38 0" fill="none" stroke="#dff7ff" stroke-width="6" stroke-linecap="round"/>
+  <path d="M37 51c6.1-5.2 15.9-5.2 22 0" fill="none" stroke="#dff7ff" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="48" cy="61" r="5" fill="#ffffff"/>
+  <path d="M24 68h16l8 8 8-8h16" fill="none" stroke="url(#mark)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M48 22v15" fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="48" cy="20" r="4" fill="#ffffff"/>
+  <text x="48" y="84" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="10" font-weight="700" fill="#e0f2fe">wlan0</text>
 </svg>

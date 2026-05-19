@@ -1,153 +1,297 @@
-use serde::Deserialize;
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+use std::env;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-/// 顶层应用配置
-#[derive(Debug, Clone)]
+const DEFAULT_CONFIG_PATH: &str = "/etc/wlan0-bootstrap/config.toml";
+const BUILTIN_CONFIG_TOML: &str = include_str!("../configs.toml");
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
+    pub interface: InterfaceConfig,
+    pub paths: PathsConfig,
     pub ap: ApConfig,
-    
-    /// 音频配置（仅在 audio feature 开启时有意义）
-    #[cfg(feature = "audio")]
-    pub audio: Option<AudioConfig>,
-}
-
-/// 用于解析 TOML 的临时结构
-#[derive(Deserialize)]
-struct AppConfigFile {
-    /// [ap] 表
-    ap: ApConfigToml,
-    
-    /// [audio] 表（可选）
-    #[cfg(feature = "audio")]
+    pub timeouts: TimeoutConfig,
+    pub commands: CommandConfig,
+    pub ownership: OwnershipConfig,
     #[serde(default)]
-    audio: Option<AudioConfig>,
+    pub platform: PlatformConfig,
 }
 
-// ============= AP 配置 =============
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InterfaceConfig {
+    pub name: String,
+}
 
-/// AP 运行时配置（包含所有网络接口、路径、DHCP 等配置）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PathsConfig {
+    pub data_dir: PathBuf,
+    pub run_dir: PathBuf,
+    pub wpa_config: PathBuf,
+    pub wpa_ctrl: PathBuf,
+    pub hostapd_config: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApConfig {
-    // === AP 基本配置 ===
-    pub ssid: String,
-    pub psk: String,
-    pub bind_addr: SocketAddr,
+    pub ssid_prefix: String,
+    pub password: String,
     pub gateway_cidr: String,
-
-    // === 网络接口配置 ===
-    pub interface_name: String,
-
-    // === DHCP 配置 ===
+    pub bind_addr: String,
     pub dhcp_range: String,
+    pub hw_mode: String,
+    pub channel: u8,
+    pub wpa: u8,
+    pub wpa_key_mgmt: String,
+    pub wpa_pairwise: String,
+    pub rsn_pairwise: String,
+}
 
-    // === 自包含配置文件路径 ===
-    pub hostapd_conf_path: String,
-    pub wpa_conf_path: String,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimeoutConfig {
+    pub scan_seconds: u64,
+    pub connect_seconds: u64,
+    pub dhcp_seconds: u64,
+    pub provisioning_idle_seconds: u64,
+}
 
-    // === wpa_supplicant 控制接口配置 ===
-    pub wpa_ctrl_interface: String,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommandConfig {
+    pub wpa_supplicant: String,
+    pub hostapd: String,
+    pub dnsmasq: String,
+    pub ip: String,
+    pub udhcpc: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OwnershipConfig {
+    pub force_takeover: bool,
     pub wpa_group: String,
     pub wpa_update_config: bool,
-
-    // === hostapd 无线配置 ===
-    pub hostapd_hw_mode: String,
-    pub hostapd_channel: u8,
-    pub hostapd_wpa: u8,
-    pub hostapd_wpa_key_mgmt: String,
-    pub hostapd_wpa_pairwise: String,
-    pub hostapd_rsn_pairwise: String,
 }
 
-#[derive(Deserialize)]
-struct ApConfigToml {
-    ap_ssid: String,
-    ap_psk: String,
-    ap_gateway_cidr: String,
-    ap_bind_addr: String,
-
-    interface_name: String,
-    dhcp_range: String,
-    hostapd_conf_path: String,
-    wpa_conf_path: String,
-    
-    wpa_ctrl_interface: String,
-    wpa_group: String,
-    wpa_update_config: bool,
-    
-    hostapd_hw_mode: String,
-    hostapd_channel: u8,
-    hostapd_wpa: u8,
-    hostapd_wpa_key_mgmt: String,
-    hostapd_wpa_pairwise: String,
-    hostapd_rsn_pairwise: String,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlatformConfig {
+    pub auto_driver_quirks: bool,
+    pub ap_mode_reset_delay_ms: u64,
 }
 
-impl From<ApConfigToml> for ApConfig {
-    fn from(t: ApConfigToml) -> Self {
-        let bind_addr =
-            SocketAddr::from_str(&t.ap_bind_addr).expect("Invalid ap_bind_addr in TOML");
-        ApConfig {
-            ssid: t.ap_ssid,
-            psk: t.ap_psk,
-            bind_addr,
-            gateway_cidr: t.ap_gateway_cidr,
-
-            interface_name: t.interface_name,
-            dhcp_range: t.dhcp_range,
-            hostapd_conf_path: t.hostapd_conf_path,
-            wpa_conf_path: t.wpa_conf_path,
-            
-            wpa_ctrl_interface: t.wpa_ctrl_interface,
-            wpa_group: t.wpa_group,
-            wpa_update_config: t.wpa_update_config,
-            
-            hostapd_hw_mode: t.hostapd_hw_mode,
-            hostapd_channel: t.hostapd_channel,
-            hostapd_wpa: t.hostapd_wpa,
-            hostapd_wpa_key_mgmt: t.hostapd_wpa_key_mgmt,
-            hostapd_wpa_pairwise: t.hostapd_wpa_pairwise,
-            hostapd_rsn_pairwise: t.hostapd_rsn_pairwise,
+impl Default for PlatformConfig {
+    fn default() -> Self {
+        Self {
+            auto_driver_quirks: true,
+            ap_mode_reset_delay_ms: 600,
         }
     }
 }
 
-// ============= 音频配置 (仅当 audio feature 开启时编译) =============
-
-/// 音频播放的文件映射
-#[cfg(feature = "audio")]
-#[derive(Deserialize, Debug, Clone)]
-pub struct AudioFilesConfig {
-    pub ap_started: String,
-    pub connection_started: String,
-    pub connection_success: String,
-    pub connection_failed: String,
+#[derive(Debug, Clone)]
+pub struct CliOptions {
+    pub config_path: Option<PathBuf>,
 }
 
-/// 音频配置
-#[cfg(feature = "audio")]
-#[derive(Deserialize, Debug, Clone)]
-pub struct AudioConfig {
-    pub device: String,
-    pub files: AudioFilesConfig,
-}
+impl CliOptions {
+    pub fn parse() -> Result<Self> {
+        let mut args = env::args_os().skip(1);
+        let mut config_path = None;
 
-// ============= 配置加载函数 =============
+        while let Some(arg) = args.next() {
+            if arg == "--config" {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--config requires a path"))?;
+                config_path = Some(PathBuf::from(value));
+                continue;
+            }
 
-/// 从 TOML 字符串加载应用配置
-pub fn load_config_from_toml_str(s: &str) -> AppConfig {
-    let parsed: AppConfigFile = toml::from_str(s).expect("Failed to parse config TOML");
+            if arg == "--help" || arg == "-h" {
+                println!("usage: wlan0-bootstrap [--config /path/to/config.toml]");
+                std::process::exit(0);
+            }
 
-    AppConfig {
-        ap: ApConfig::from(parsed.ap),
-        
-        #[cfg(feature = "audio")]
-        audio: parsed.audio,
+            return Err(anyhow!("unknown argument: {:?}", arg));
+        }
+
+        Ok(Self { config_path })
     }
 }
 
-/// 为向后兼容保留的函数（已弃用）
-pub fn ap_config_from_toml_str(s: &str) -> ApConfig {
-    let app_config = load_config_from_toml_str(s);
-    app_config.ap
+impl AppConfig {
+    pub fn load(options: &CliOptions) -> Result<Self> {
+        // 产品部署优先读取 /etc 下的运行时配置。
+        // 仓库内 configs.toml 只作为开发和缺省兜底，不应成为量产设备的唯一配置来源。
+        let config = match &options.config_path {
+            Some(path) => Self::load_from_path(path)?,
+            None => match Self::load_from_path(Path::new(DEFAULT_CONFIG_PATH)) {
+                Ok(config) => config,
+                Err(err) if is_not_found(&err) => {
+                    tracing::warn!(
+                        "Config file {} not found; using built-in fallback config",
+                        DEFAULT_CONFIG_PATH
+                    );
+                    Self::load_from_str(BUILTIN_CONFIG_TOML)
+                        .context("failed to parse built-in config")?
+                }
+                Err(err) => return Err(err),
+            },
+        };
+
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn load_from_path(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config {}", path.display()))?;
+        Self::load_from_str(&content)
+            .with_context(|| format!("failed to parse config {}", path.display()))
+    }
+
+    pub fn load_from_str(content: &str) -> Result<Self> {
+        toml::from_str(content).context("invalid TOML config")
+    }
+
+    pub fn bind_addr(&self) -> Result<SocketAddr> {
+        SocketAddr::from_str(&self.ap.bind_addr)
+            .with_context(|| format!("invalid AP bind address {}", self.ap.bind_addr))
+    }
+
+    pub fn networks_path(&self) -> PathBuf {
+        // 已知网络属于持久化数据，放在 data_dir 下，适配只读 rootfs 的 Buildroot 设备。
+        self.paths.data_dir.join("networks.toml")
+    }
+
+    pub fn status_path(&self) -> PathBuf {
+        self.paths.run_dir.join("status.json")
+    }
+
+    pub fn event_socket_path(&self) -> PathBuf {
+        self.paths.run_dir.join("events.sock")
+    }
+
+    pub fn ap_ssid(&self) -> String {
+        self.ap.ssid_prefix.clone()
+    }
+
+    fn validate(&self) -> Result<()> {
+        // 配置校验只检查会导致启动失败或死循环的硬约束。
+        // 具体命令是否存在、接口是否存在由 preflight 在运行环境中检查。
+        if self.interface.name.trim().is_empty() {
+            return Err(anyhow!("interface.name must not be empty"));
+        }
+        if self.ap.password.len() < 8 {
+            return Err(anyhow!("ap.password must contain at least 8 characters"));
+        }
+        if self.timeouts.scan_seconds == 0 {
+            return Err(anyhow!("timeouts.scan_seconds must be greater than zero"));
+        }
+        if self.timeouts.connect_seconds == 0 {
+            return Err(anyhow!(
+                "timeouts.connect_seconds must be greater than zero"
+            ));
+        }
+        if self.timeouts.dhcp_seconds == 0 {
+            return Err(anyhow!("timeouts.dhcp_seconds must be greater than zero"));
+        }
+        if self.timeouts.provisioning_idle_seconds == 0 {
+            return Err(anyhow!(
+                "timeouts.provisioning_idle_seconds must be greater than zero"
+            ));
+        }
+        self.bind_addr()?;
+        Ok(())
+    }
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> AppConfig {
+        AppConfig::load_from_str(
+            r#"
+[interface]
+name = "wlan0"
+
+[paths]
+data_dir = "/data/wlan0-bootstrap"
+run_dir = "/run/wlan0-bootstrap"
+wpa_config = "/run/wlan0-bootstrap/wpa_supplicant.conf"
+wpa_ctrl = "/run/wpa_supplicant"
+hostapd_config = "/run/wlan0-bootstrap/hostapd.conf"
+
+[ap]
+ssid_prefix = "wlan0-bootstrap"
+password = "change-me"
+gateway_cidr = "192.168.4.1/24"
+bind_addr = "192.168.4.1:80"
+dhcp_range = "192.168.4.100,192.168.4.200,12h"
+hw_mode = "g"
+channel = 6
+wpa = 2
+wpa_key_mgmt = "WPA-PSK"
+wpa_pairwise = "CCMP"
+rsn_pairwise = "CCMP"
+
+[timeouts]
+scan_seconds = 10
+connect_seconds = 30
+dhcp_seconds = 20
+provisioning_idle_seconds = 600
+
+[commands]
+wpa_supplicant = "wpa_supplicant"
+hostapd = "hostapd"
+dnsmasq = "dnsmasq"
+ip = "ip"
+udhcpc = "udhcpc"
+
+[ownership]
+force_takeover = false
+wpa_group = "netdev"
+wpa_update_config = false
+"#,
+        )
+        .expect("test config should parse")
+    }
+
+    #[test]
+    fn validate_rejects_zero_runtime_timeouts() {
+        let mut config = valid_config();
+        config.timeouts.dhcp_seconds = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.timeouts.provisioning_idle_seconds = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn derived_paths_use_configured_directories() {
+        let config = valid_config();
+
+        assert_eq!(
+            config.networks_path(),
+            PathBuf::from("/data/wlan0-bootstrap/networks.toml")
+        );
+        assert_eq!(
+            config.status_path(),
+            PathBuf::from("/run/wlan0-bootstrap/status.json")
+        );
+        assert_eq!(
+            config.event_socket_path(),
+            PathBuf::from("/run/wlan0-bootstrap/events.sock")
+        );
+    }
 }

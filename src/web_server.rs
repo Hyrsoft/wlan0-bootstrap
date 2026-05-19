@@ -2,7 +2,7 @@ use crate::backend::WpaCtrlBackend;
 use crate::embed::EmbedFrontend;
 use crate::networks::{KnownNetworks, NetworkStore};
 use crate::status::StatusPublisher;
-use crate::structs::{ConnectAccepted, ConnectionRequest, Network};
+use crate::structs::{ConnectAccepted, ConnectionRequest};
 use crate::traits::UiAssetProvider;
 use anyhow::Context;
 use axum::{
@@ -31,7 +31,6 @@ struct AppState {
     status: Arc<StatusPublisher>,
     known_networks: Arc<Mutex<KnownNetworks>>,
     store: NetworkStore,
-    scanned_networks: Vec<Network>,
     ui_provider: Arc<dyn UiAssetProvider>,
     connect_in_progress: AtomicBool,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
@@ -42,7 +41,6 @@ pub async fn run_server(
     status: Arc<StatusPublisher>,
     known_networks: Arc<Mutex<KnownNetworks>>,
     store: NetworkStore,
-    scanned_networks: Vec<Network>,
 ) -> anyhow::Result<ProvisioningExit> {
     // Web 服务只在配网窗口内运行。
     // 连接成功或空闲超时都会触发 graceful shutdown，把控制权交还给主循环。
@@ -53,7 +51,6 @@ pub async fn run_server(
         status,
         known_networks,
         store,
-        scanned_networks,
         ui_provider: Arc::new(EmbedFrontend::new()),
         connect_in_progress: AtomicBool::new(false),
         shutdown: Mutex::new(Some(connected_tx)),
@@ -101,13 +98,14 @@ pub async fn run_server(
 }
 
 async fn api_scan(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // 返回进入 AP 前的扫描缓存。
+    // 返回 backend 维护的扫描缓存。
     // 单射频设备此时正在提供 Soft AP，不在这里重新触发 STA 扫描。
+    let networks = state.backend.cached_networks().await;
     tracing::info!(
         "web api scan requested; returning {} cached networks",
-        state.scanned_networks.len()
+        networks.len()
     );
-    (StatusCode::OK, Json(state.scanned_networks.clone()))
+    (StatusCode::OK, Json(networks))
 }
 
 async fn api_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {

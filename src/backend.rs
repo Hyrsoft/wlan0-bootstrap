@@ -28,6 +28,7 @@ pub struct WpaCtrlBackend {
     dnsmasq: tokio::sync::Mutex<Option<Child>>,
     cmd_ctrl: Arc<Mutex<Option<WpaController>>>,
     device_profile: RwLock<Option<DeviceProfile>>,
+    scan_cache: RwLock<Vec<Network>>,
 }
 
 impl WpaCtrlBackend {
@@ -40,6 +41,7 @@ impl WpaCtrlBackend {
             dnsmasq: tokio::sync::Mutex::new(None),
             cmd_ctrl: Arc::new(Mutex::new(None)),
             device_profile: RwLock::new(None),
+            scan_cache: RwLock::new(Vec::new()),
         }
     }
 
@@ -116,7 +118,17 @@ impl WpaCtrlBackend {
                 .await?;
         }
 
+        self.replace_scan_cache(networks.clone()).await;
         Ok(networks)
+    }
+
+    pub async fn cached_networks(&self) -> Vec<Network> {
+        self.scan_cache.read().await.clone()
+    }
+
+    async fn replace_scan_cache(&self, networks: Vec<Network>) {
+        tracing::info!("updated Wi-Fi scan cache: networks={}", networks.len());
+        *self.scan_cache.write().await = networks;
     }
 
     pub async fn start_provisioning_ap(&self) -> Result<()> {
@@ -226,10 +238,12 @@ impl WpaCtrlBackend {
             Err(err) => {
                 let message = err.to_string();
                 tracing::warn!(
-                    "STA connection failed from provisioning: ssid={} error={}; restoring AP",
+                    "STA connection failed from provisioning: ssid={} error={}; refreshing scan cache before restoring AP",
                     request.ssid,
                     message
                 );
+                self.refresh_scan_cache_before_ap_restore(&request.ssid)
+                    .await;
                 self.status
                     .set_error(
                         classify_connection_error(&message),
@@ -239,6 +253,33 @@ impl WpaCtrlBackend {
                     .await?;
                 self.start_provisioning_ap().await?;
                 Err(err)
+            }
+        }
+    }
+
+    async fn refresh_scan_cache_before_ap_restore(&self, ssid: &str) {
+        // 连接失败后仍处在 STA/wpa_supplicant 控制路径上，此时还没有重新启动 hostapd。
+        // 在这里额外扫描一次，可以让恢复 AP 后的 /api/scan 返回更新过的 Wi-Fi 列表。
+        tracing::info!(
+            "refreshing Wi-Fi scan cache before provisioning AP restore: failed_ssid={}",
+            ssid
+        );
+        match self.scan_once().await {
+            Ok(networks) => {
+                let count = networks.len();
+                self.replace_scan_cache(networks).await;
+                tracing::info!(
+                    "refreshed Wi-Fi scan cache before provisioning AP restore: networks={}",
+                    count
+                );
+            }
+            Err(err) => {
+                // 扫描失败不能阻断 AP 回退，否则用户会失去继续配网的入口。
+                tracing::warn!(
+                    "failed to refresh Wi-Fi scan cache before provisioning AP restore: ssid={} error={}",
+                    ssid,
+                    err
+                );
             }
         }
     }

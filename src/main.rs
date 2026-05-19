@@ -86,7 +86,6 @@ async fn run_loop(
             status.clone(),
             known_networks.clone(),
             store.clone(),
-            scanned,
         )
         .await?;
 

@@ -225,6 +225,11 @@ impl WpaCtrlBackend {
             request.ssid
         );
         let _ = self.stop_ap().await;
+        if let Err(err) = self.apply_bcmdhd_mode_switch_reset_quirk("ap_to_sta").await {
+            // AP->STA 复位属于平台兼容性补丁，失败时继续交给 wpa_supplicant 尝试连接。
+            // 这样不会因为一个补丁命令失败而直接丢掉 Web 配网流程的 AP 回退能力。
+            tracing::warn!("failed to apply AP->STA platform quirk: {}", err);
+        }
 
         match self.connect_station(request).await {
             Ok(info) => {
@@ -589,7 +594,7 @@ impl WpaCtrlBackend {
         tracing::info!("preparing AP services on {}", self.config.interface.name);
         let _ = self.stop_ap().await;
         self.flush_interface_ipv4().await?;
-        self.apply_ap_mode_reset_quirk().await?;
+        self.apply_bcmdhd_mode_switch_reset_quirk("to_ap").await?;
 
         let output = Command::new(&self.config.commands.ip)
             .arg("addr")
@@ -687,7 +692,7 @@ impl WpaCtrlBackend {
         Ok(())
     }
 
-    async fn apply_ap_mode_reset_quirk(&self) -> Result<()> {
+    async fn apply_bcmdhd_mode_switch_reset_quirk(&self, context: &str) -> Result<()> {
         if !self.config.platform.auto_driver_quirks {
             return Ok(());
         }
@@ -701,13 +706,14 @@ impl WpaCtrlBackend {
             return Ok(());
         }
 
-        // RK + Broadcom bcmdhd 在 AP->STA 失败->AP 的快速切换中，
-        // 可能保留上一次 AP beacon/security 状态，导致 hostapd 第二次启动时报
-        // "Failed to set beacon parameters" 或 rsn_cap_value error。
+        // RK + Broadcom bcmdhd 在 AP/STA 模式切换中会保留部分固件状态。
+        // 进入 AP 前不复位，hostapd 第二次启动可能报 beacon/security 参数错误；
+        // 从 AP 切回 STA 前不复位，wpa_supplicant 可能在 ASSOCIATING 后被 AP 拒绝。
         // 这里仅对自动识别出的 bcmdhd 设备做接口 down/up 复位，不影响其他平台。
         tracing::info!(
-            "applying platform quirk rockchip_bcmdhd_ap_mode_reset on {}",
-            self.config.interface.name
+            "applying platform quirk rockchip_bcmdhd_ap_mode_reset on {}: context={}",
+            self.config.interface.name,
+            context
         );
         self.set_interface_down().await?;
         tokio::time::sleep(Duration::from_millis(

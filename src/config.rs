@@ -104,6 +104,8 @@ impl CliOptions {
 
 impl AppConfig {
     pub fn load(options: &CliOptions) -> Result<Self> {
+        // 产品部署优先读取 /etc 下的运行时配置。
+        // 仓库内 configs.toml 只作为开发和缺省兜底，不应成为量产设备的唯一配置来源。
         let config = match &options.config_path {
             Some(path) => Self::load_from_path(path)?,
             None => match Self::load_from_path(Path::new(DEFAULT_CONFIG_PATH)) {
@@ -141,6 +143,7 @@ impl AppConfig {
     }
 
     pub fn networks_path(&self) -> PathBuf {
+        // 已知网络属于持久化数据，放在 data_dir 下，适配只读 rootfs 的 Buildroot 设备。
         self.paths.data_dir.join("networks.toml")
     }
 
@@ -157,6 +160,8 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        // 配置校验只检查会导致启动失败或死循环的硬约束。
+        // 具体命令是否存在、接口是否存在由 preflight 在运行环境中检查。
         if self.interface.name.trim().is_empty() {
             return Err(anyhow!("interface.name must not be empty"));
         }
@@ -171,6 +176,14 @@ impl AppConfig {
                 "timeouts.connect_seconds must be greater than zero"
             ));
         }
+        if self.timeouts.dhcp_seconds == 0 {
+            return Err(anyhow!("timeouts.dhcp_seconds must be greater than zero"));
+        }
+        if self.timeouts.provisioning_idle_seconds == 0 {
+            return Err(anyhow!(
+                "timeouts.provisioning_idle_seconds must be greater than zero"
+            ));
+        }
         self.bind_addr()?;
         Ok(())
     }
@@ -182,4 +195,86 @@ fn is_not_found(err: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> AppConfig {
+        AppConfig::load_from_str(
+            r#"
+[interface]
+name = "wlan0"
+
+[paths]
+data_dir = "/data/wlan0-bootstrap"
+run_dir = "/run/wlan0-bootstrap"
+wpa_config = "/run/wlan0-bootstrap/wpa_supplicant.conf"
+wpa_ctrl = "/run/wpa_supplicant"
+hostapd_config = "/run/wlan0-bootstrap/hostapd.conf"
+
+[ap]
+ssid_prefix = "wlan0-bootstrap"
+password = "change-me"
+gateway_cidr = "192.168.4.1/24"
+bind_addr = "192.168.4.1:80"
+dhcp_range = "192.168.4.100,192.168.4.200,12h"
+hw_mode = "g"
+channel = 6
+wpa = 2
+wpa_key_mgmt = "WPA-PSK"
+wpa_pairwise = "CCMP"
+rsn_pairwise = "CCMP"
+
+[timeouts]
+scan_seconds = 10
+connect_seconds = 30
+dhcp_seconds = 20
+provisioning_idle_seconds = 600
+
+[commands]
+wpa_supplicant = "wpa_supplicant"
+hostapd = "hostapd"
+dnsmasq = "dnsmasq"
+ip = "ip"
+udhcpc = "udhcpc"
+
+[ownership]
+force_takeover = false
+wpa_group = "netdev"
+wpa_update_config = false
+"#,
+        )
+        .expect("test config should parse")
+    }
+
+    #[test]
+    fn validate_rejects_zero_runtime_timeouts() {
+        let mut config = valid_config();
+        config.timeouts.dhcp_seconds = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.timeouts.provisioning_idle_seconds = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn derived_paths_use_configured_directories() {
+        let config = valid_config();
+
+        assert_eq!(
+            config.networks_path(),
+            PathBuf::from("/data/wlan0-bootstrap/networks.toml")
+        );
+        assert_eq!(
+            config.status_path(),
+            PathBuf::from("/run/wlan0-bootstrap/status.json")
+        );
+        assert_eq!(
+            config.event_socket_path(),
+            PathBuf::from("/run/wlan0-bootstrap/events.sock")
+        );
+    }
 }

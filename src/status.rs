@@ -79,6 +79,8 @@ pub struct StatusPublisher {
 
 impl StatusPublisher {
     pub async fn new(status_path: PathBuf, event_socket_path: PathBuf) -> Result<Arc<Self>> {
+        // 状态快照和事件 socket 都放在 run_dir 下。
+        // 快照给轮询型消费者使用，socket 给音频/屏幕/LED 等事件型消费者使用。
         if let Some(parent) = status_path.parent() {
             fs::create_dir_all(parent)
                 .await
@@ -107,6 +109,8 @@ impl StatusPublisher {
     }
 
     pub async fn start_event_server(self: &Arc<Self>) -> Result<()> {
+        // Unix socket 使用 newline-delimited JSON。
+        // 新订阅者只接收订阅之后的事件，当前状态请读取 status.json。
         match fs::remove_file(&self.event_socket_path).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -164,12 +168,37 @@ impl StatusPublisher {
         ssid: Option<String>,
         address: Option<String>,
     ) -> Result<()> {
+        // 状态变化必须先落盘快照，再广播事件。
+        // 这样外部程序错过事件时仍能从 status.json 恢复当前状态。
+        self.set_state_inner(state, ssid, address, true).await
+    }
+
+    pub async fn set_state_retaining_error(
+        &self,
+        state: WifiState,
+        ssid: Option<String>,
+        address: Option<String>,
+    ) -> Result<()> {
+        // 失败后恢复 Soft AP 时保留 last_error。
+        // Web UI 通过轮询 status.json 展示失败原因，不能只依赖瞬时事件。
+        self.set_state_inner(state, ssid, address, false).await
+    }
+
+    async fn set_state_inner(
+        &self,
+        state: WifiState,
+        ssid: Option<String>,
+        address: Option<String>,
+        clear_error: bool,
+    ) -> Result<()> {
         {
             let mut snapshot = self.snapshot.write().await;
             snapshot.state = state;
             snapshot.ssid = ssid.clone();
             snapshot.address = address.clone();
-            snapshot.last_error = None;
+            if clear_error {
+                snapshot.last_error = None;
+            }
         }
         self.write_snapshot().await?;
         let _ = self.events.send(StatusEvent::StateChanged {
@@ -186,6 +215,7 @@ impl StatusPublisher {
         message: impl Into<String>,
         ssid: Option<String>,
     ) -> Result<()> {
+        // 错误也统一表现为状态快照和事件，UI 与外部提示程序使用同一份事实来源。
         let message = message.into();
         {
             let mut snapshot = self.snapshot.write().await;

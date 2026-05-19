@@ -13,7 +13,7 @@ hostapd_config = "/run/wlan0-bootstrap/hostapd.conf"
 
 [ap]
 ssid_prefix = "wlan0-bootstrap"
-password = "change-me"
+password = "12345678"
 gateway_cidr = "192.168.4.1/24"
 bind_addr = "192.168.4.1:80"
 dhcp_range = "192.168.4.100,192.168.4.200,12h"

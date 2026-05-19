@@ -43,7 +43,28 @@ impl WpaCtrlBackend {
         &self.config
     }
 
+    pub async fn shutdown(&self) {
+        // 进程因错误退出或被上层要求停止时，必须清理本程序启动的系统工具。
+        // 否则 Buildroot 设备上会留下孤儿 wpa_supplicant/hostapd/dnsmasq，影响下一次配网。
+        let _ = self.stop_ap().await;
+
+        let had_wpa_supplicant = if let Some(mut child) = self.wpa_supplicant.lock().await.take() {
+            let _ = child.kill().await;
+            true
+        } else {
+            false
+        };
+
+        if had_wpa_supplicant {
+            let _ = self.flush_interface_ipv4().await;
+            self.remove_existing_wpa_socket().await;
+        }
+    }
+
     pub async fn prepare(&self) -> Result<()> {
+        // 启动阶段只做当前进程必须拥有的准备工作：
+        // 目录、命令、网卡、wpa_supplicant 控制 socket。
+        // 不在这里清理其他网络管理器，避免误杀产品系统上的外部进程。
         self.status
             .set_state(WifiState::Preflight, None, None)
             .await?;
@@ -53,22 +74,40 @@ impl WpaCtrlBackend {
     }
 
     pub async fn scan(&self) -> Result<Vec<Network>> {
+        // 扫描仍通过 wpa_supplicant 控制接口完成。
+        // 这里缓存的是进入 Soft AP 前的 STA 扫描结果，供配网页展示。
         self.status
             .set_state(WifiState::Scanning, None, None)
             .await?;
         let mut networks = Vec::new();
+        let mut last_error = None;
         for attempt in 1..=3 {
             tracing::info!("Scanning Wi-Fi networks, attempt {}", attempt);
-            networks = self.scan_once().await?;
-            if !networks.is_empty() {
-                break;
+            match self.scan_once().await {
+                Ok(found) => {
+                    networks = found;
+                    if !networks.is_empty() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("scan attempt {} failed: {}", attempt, err);
+                    last_error = Some(err.to_string());
+                }
             }
-            tokio::time::sleep(Duration::from_secs(self.config.timeouts.scan_seconds)).await;
+
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_secs(self.config.timeouts.scan_seconds)).await;
+            }
         }
 
         if networks.is_empty() {
+            let message = last_error.map_or_else(
+                || "scan returned no networks".to_string(),
+                |err| format!("scan failed after retries: {}", err),
+            );
             self.status
-                .set_error(ErrorReason::ScanFailed, "scan returned no networks", None)
+                .set_error(ErrorReason::ScanFailed, message, None)
                 .await?;
         }
 
@@ -76,18 +115,45 @@ impl WpaCtrlBackend {
     }
 
     pub async fn start_provisioning_ap(&self) -> Result<()> {
-        self.status
-            .set_state(WifiState::ProvisioningApStarting, None, None)
+        // 单射频设备不能假设 AP+STA 并发可用。
+        // 进入配网时先切到 AP 流程，由 hostapd/dnsmasq 提供临时网络。
+        self.set_provisioning_state(WifiState::ProvisioningApStarting, None, None)
             .await?;
-        self.start_ap().await?;
-        self.status
-            .set_state(
-                WifiState::ProvisioningApRunning,
-                Some(self.config.ap_ssid()),
-                Some(self.config.ap.bind_addr.clone()),
-            )
-            .await?;
+        if let Err(err) = self.start_ap().await {
+            let message = err.to_string();
+            self.status
+                .set_error(ErrorReason::ApStartFailed, message.clone(), None)
+                .await?;
+            return Err(anyhow!(message));
+        }
+        self.set_provisioning_state(
+            WifiState::ProvisioningApRunning,
+            Some(self.config.ap_ssid()),
+            Some(self.config.ap.bind_addr.clone()),
+        )
+        .await?;
         Ok(())
+    }
+
+    pub async fn stop_provisioning_ap(&self) -> Result<()> {
+        self.stop_ap().await
+    }
+
+    async fn set_provisioning_state(
+        &self,
+        state: WifiState,
+        ssid: Option<String>,
+        address: Option<String>,
+    ) -> Result<()> {
+        // 如果刚经历连接失败，恢复 AP 时保留 last_error，方便 Web UI 展示失败原因。
+        // 普通进入 AP 时没有 last_error，保留行为不会引入额外状态。
+        if self.status.snapshot().await.last_error.is_some() {
+            self.status
+                .set_state_retaining_error(state, ssid, address)
+                .await
+        } else {
+            self.status.set_state(state, ssid, address).await
+        }
     }
 
     pub async fn connect_known(&self, known: &KnownNetwork) -> Result<ConnectedInfo> {
@@ -105,6 +171,8 @@ impl WpaCtrlBackend {
         &self,
         request: &ConnectionRequest,
     ) -> Result<ConnectedInfo> {
+        // 用户提交新 Wi-Fi 后必须停止 Soft AP，再切回 STA 连接目标网络。
+        // 如果连接失败，会重新启动 Soft AP，让用户能继续修改密码或选择网络。
         self.status
             .set_state(
                 WifiState::ProvisioningConnecting,
@@ -132,6 +200,8 @@ impl WpaCtrlBackend {
     }
 
     pub async fn monitor_until_disconnected(&self, ssid: &str) {
+        // 当前监控策略保持简单：轮询 wpa_supplicant 的 STATUS。
+        // 一旦不再是 COMPLETED，就回到主循环重新扫描和决策。
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let status = match self.send_cmd("STATUS").await {
@@ -200,8 +270,14 @@ impl WpaCtrlBackend {
     }
 
     async fn ensure_station_daemon(&self) -> Result<()> {
+        // 默认不接管已有 wpa_supplicant。
+        // 如果 socket 已存在，认为接口可能被外部进程管理，直接失败并发布状态。
+        self.check_existing_interface_owner().await?;
+        self.check_existing_wpa_socket().await?;
         self.write_wpa_config().await?;
-        self.remove_stale_wpa_socket().await;
+        if self.config.ownership.force_takeover {
+            self.remove_existing_wpa_socket().await;
+        }
         self.set_interface_up().await?;
 
         let child = Command::new(&self.config.commands.wpa_supplicant)
@@ -227,7 +303,70 @@ impl WpaCtrlBackend {
         Ok(())
     }
 
+    async fn check_existing_interface_owner(&self) -> Result<()> {
+        // 真实设备上不一定会留下 /run/wpa_supplicant/wlan0。
+        // 例如 Luckfox Buildroot 镜像会通过 rkwifi_server 和 /data/wpa_supplicant.conf
+        // 先启动自己的 wpa_supplicant；这类 owner 必须在启动本程序前拦截。
+        if self.config.ownership.force_takeover {
+            return Ok(());
+        }
+
+        let output = match Command::new("ps").arg("-ef").output().await {
+            Ok(output) => output,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to inspect process list for interface owner: {}",
+                    err
+                );
+                return Ok(());
+            }
+        };
+
+        if !output.status.success() {
+            tracing::warn!(
+                "ps -ef failed while checking interface owner: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(owner) = find_interface_owner(&stdout, &self.config.interface.name) {
+            let message = format!(
+                "interface {} appears to be managed by another process: {}; stop the existing owner or set ownership.force_takeover=true only for explicit takeover",
+                self.config.interface.name, owner
+            );
+            self.status
+                .set_error(ErrorReason::InterfaceBusy, message.clone(), None)
+                .await?;
+            return Err(anyhow!(message));
+        }
+
+        Ok(())
+    }
+
+    async fn check_existing_wpa_socket(&self) -> Result<()> {
+        // 这里只检查控制 socket，属于保守策略。
+        // 后续可结合 pidfile 或进程命令行进一步区分 stale socket 和外部 owner。
+        let socket_path = self.config.paths.wpa_ctrl.join(&self.config.interface.name);
+        if !socket_path.exists() || self.config.ownership.force_takeover {
+            return Ok(());
+        }
+
+        let message = format!(
+            "wpa_supplicant control socket already exists at {}; set ownership.force_takeover=true only when this daemon may take over {}",
+            socket_path.display(),
+            self.config.interface.name
+        );
+        self.status
+            .set_error(ErrorReason::InterfaceBusy, message.clone(), None)
+            .await?;
+        Err(anyhow!(message))
+    }
+
     async fn write_wpa_config(&self) -> Result<()> {
+        // wpa_supplicant.conf 只作为运行期控制入口，不作为已知网络数据库。
+        // 已知网络由 networks.toml 维护，避免让 SAVE_CONFIG 改写部署配置。
         if let Some(parent) = self.config.paths.wpa_config.parent() {
             fs::create_dir_all(parent)
                 .await
@@ -259,10 +398,10 @@ impl WpaCtrlBackend {
         Ok(())
     }
 
-    async fn remove_stale_wpa_socket(&self) {
+    async fn remove_existing_wpa_socket(&self) {
         let socket_path = self.config.paths.wpa_ctrl.join(&self.config.interface.name);
         match fs::remove_file(&socket_path).await {
-            Ok(()) => tracing::debug!("removed stale socket {}", socket_path.display()),
+            Ok(()) => tracing::debug!("removed existing socket {}", socket_path.display()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => tracing::warn!("failed to remove {}: {}", socket_path.display(), err),
         }
@@ -289,6 +428,8 @@ impl WpaCtrlBackend {
     }
 
     async fn send_cmd(&self, cmd: &str) -> Result<String> {
+        // wpa-ctrl crate 的 request/recv 是阻塞接口。
+        // 放到 spawn_blocking 中执行，避免占用 tokio worker 线程。
         {
             let ctrl_guard = self
                 .cmd_ctrl
@@ -338,7 +479,10 @@ impl WpaCtrlBackend {
     }
 
     async fn start_ap(&self) -> Result<()> {
+        // AP/DHCP 仍然调用系统 hostapd 和 dnsmasq。
+        // 这里不做内置 AP 或 DHCP server，实现边界保持清晰。
         let _ = self.stop_ap().await;
+        self.flush_interface_ipv4().await?;
 
         let output = Command::new(&self.config.commands.ip)
             .arg("addr")
@@ -357,6 +501,8 @@ impl WpaCtrlBackend {
             }
         }
 
+        // 这里的 wpa_passphrase 是 hostapd 配置项，表示 Soft AP 的接入密码；
+        // 它不是 wpa_passphrase 命令，也不参与 STA 已知网络密码的持久化。
         let hostapd_conf = format!(
             "interface={}\nssid={}\nwpa={}\nwpa_passphrase={}\nhw_mode={}\nchannel={}\nwpa_key_mgmt={}\nwpa_pairwise={}\nrsn_pairwise={}\n",
             self.config.interface.name,
@@ -380,10 +526,11 @@ impl WpaCtrlBackend {
 
         let hostapd = Command::new(&self.config.commands.hostapd)
             .arg(&self.config.paths.hostapd_config)
-            .arg("-B")
             .spawn()
             .context("failed to start hostapd")?;
         *self.hostapd.lock().await = Some(hostapd);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.ensure_child_running(&self.hostapd, "hostapd").await?;
 
         let ap_ip = self
             .config
@@ -402,8 +549,62 @@ impl WpaCtrlBackend {
             .spawn()
             .context("failed to start dnsmasq")?;
         *self.dnsmasq.lock().await = Some(dnsmasq);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.ensure_child_running(&self.dnsmasq, "dnsmasq").await?;
 
         Ok(())
+    }
+
+    async fn flush_interface_ipv4(&self) -> Result<()> {
+        // 进入 Soft AP 前清理 STA 阶段遗留的 IPv4 地址。
+        // 单射频 TDM 下同一接口不应同时保留上游 Wi-Fi 地址和 AP 网关地址。
+        let output = Command::new(&self.config.commands.ip)
+            .arg("-4")
+            .arg("addr")
+            .arg("flush")
+            .arg("dev")
+            .arg(&self.config.interface.name)
+            .output()
+            .await
+            .context("failed to flush interface IPv4 addresses")?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "failed to flush interface IPv4 addresses: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    async fn ensure_child_running(
+        &self,
+        child_slot: &tokio::sync::Mutex<Option<Child>>,
+        name: &str,
+    ) -> Result<()> {
+        let mut guard = child_slot.lock().await;
+        let Some(child) = guard.as_mut() else {
+            return Err(anyhow!("{} process was not started", name));
+        };
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                drop(guard);
+                let _ = self.stop_ap().await;
+                Err(anyhow!(
+                    "{} exited immediately with status {}",
+                    name,
+                    status
+                ))
+            }
+            Ok(None) => Ok(()),
+            Err(err) => {
+                drop(guard);
+                let _ = self.stop_ap().await;
+                Err(anyhow!("failed to check {} process status: {}", name, err))
+            }
+        }
     }
 
     async fn stop_ap(&self) -> Result<()> {
@@ -445,6 +646,8 @@ impl WpaCtrlBackend {
     }
 
     async fn connect_station(&self, request: &ConnectionRequest) -> Result<ConnectedInfo> {
+        // 连接动作全部通过 wpa_supplicant 控制接口完成。
+        // request.password 可能是明文密码，也可能是历史数据中的 64 位 raw PSK。
         let net_id = self.add_network().await?;
         let result = self.configure_and_enable_network(net_id, request).await;
         if let Err(err) = result {
@@ -452,7 +655,16 @@ impl WpaCtrlBackend {
             return Err(err);
         }
 
-        let connected = self.wait_for_connection(request, net_id).await?;
+        let connected = match self.wait_for_connection(request, net_id).await {
+            Ok(connected) => connected,
+            Err(err) => {
+                // 关联超时、密码错误或 DHCP 失败后必须释放 STA network。
+                // 否则回到 Soft AP 时 wpa_supplicant 仍可能占着接口，hostapd 会启动失败。
+                let _ = self.send_cmd("DISCONNECT").await;
+                let _ = self.send_cmd(&format!("REMOVE_NETWORK {}", net_id)).await;
+                return Err(err);
+            }
+        };
         if self.config.ownership.wpa_update_config {
             let _ = self.send_cmd("SAVE_CONFIG").await;
         }
@@ -491,7 +703,7 @@ impl WpaCtrlBackend {
             self.send_cmd(&format!(
                 "SET_NETWORK {} psk {}",
                 net_id,
-                quote_wpa_string(&request.password)
+                format_wpa_psk(&request.password)
             ))
             .await?;
         }
@@ -541,20 +753,57 @@ impl WpaCtrlBackend {
     }
 
     async fn run_dhcp(&self) -> Result<Option<String>> {
-        let status = Command::new(&self.config.commands.udhcpc)
+        let mut child = Command::new(&self.config.commands.udhcpc)
             .arg("-i")
             .arg(&self.config.interface.name)
             .arg("-q")
             .arg("-n")
-            .status()
-            .await
-            .context("failed to run udhcpc")?;
+            .spawn()
+            .context("failed to start udhcpc")?;
+
+        let status = match tokio::time::timeout(
+            Duration::from_secs(self.config.timeouts.dhcp_seconds),
+            child.wait(),
+        )
+        .await
+        {
+            Ok(result) => result.context("failed to wait for udhcpc")?,
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(anyhow!("dhcp_timeout"));
+            }
+        };
 
         if !status.success() {
             return Err(anyhow!("dhcp_failed"));
         }
 
-        Ok(None)
+        self.read_interface_ipv4().await
+    }
+
+    async fn read_interface_ipv4(&self) -> Result<Option<String>> {
+        // DHCP 客户端成功后，再用系统 ip 命令读取接口地址。
+        // udhcpc 的脚本行为在不同 Buildroot 产品上可能不同，直接解析 stdout 不稳。
+        let output = Command::new(&self.config.commands.ip)
+            .arg("-4")
+            .arg("-o")
+            .arg("addr")
+            .arg("show")
+            .arg("dev")
+            .arg(&self.config.interface.name)
+            .output()
+            .await
+            .context("failed to read interface IPv4 address")?;
+
+        if !output.status.success() {
+            tracing::warn!(
+                "failed to read IPv4 address: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(None);
+        }
+
+        Ok(parse_ipv4_addr(&String::from_utf8_lossy(&output.stdout)))
     }
 }
 
@@ -648,8 +897,20 @@ fn quote_wpa_string(value: &str) -> String {
     quoted
 }
 
+fn format_wpa_psk(value: &str) -> String {
+    if is_raw_wpa_psk(value) {
+        value.to_string()
+    } else {
+        quote_wpa_string(value)
+    }
+}
+
+fn is_raw_wpa_psk(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn classify_connection_error(message: &str) -> ErrorReason {
-    if message.contains("dhcp_failed") {
+    if message.contains("dhcp_failed") || message.contains("dhcp_timeout") {
         ErrorReason::DhcpFailed
     } else if message.contains("association_timeout") {
         ErrorReason::AssociationTimeout
@@ -662,6 +923,41 @@ fn classify_connection_error(message: &str) -> ErrorReason {
     }
 }
 
+fn parse_ipv4_addr(output: &str) -> Option<String> {
+    let mut parts = output.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part != "inet" {
+            continue;
+        }
+
+        let cidr = parts.next()?;
+        return Some(
+            cidr.split_once('/')
+                .map_or(cidr, |(address, _)| address)
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn find_interface_owner<'a>(process_list: &'a str, iface: &str) -> Option<&'a str> {
+    process_list.lines().find(|line| {
+        is_wpa_supplicant_for_iface(line, iface)
+            || line.contains("rkwifi_server")
+            || line.contains("NetworkManager")
+            || line.contains("connmand")
+    })
+}
+
+fn is_wpa_supplicant_for_iface(line: &str, iface: &str) -> bool {
+    line.contains("wpa_supplicant")
+        && (line.contains(&format!("-i {}", iface))
+            || line.contains(&format!("-i{}", iface))
+            || line.contains(&format!("--interface {}", iface))
+            || line.contains(&format!("--interface={}", iface)))
+}
+
 fn command_exists(command: &str) -> bool {
     let path = Path::new(command);
     if path.components().count() > 1 {
@@ -672,4 +968,62 @@ fn command_exists(command: &str) -> bool {
         .into_iter()
         .flat_map(|paths| env::split_paths(&paths).collect::<Vec<PathBuf>>())
         .any(|dir| dir.join(command).exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_scan_results_deduplicates_and_decodes_ssid() {
+        let output = "\
+bssid / frequency / signal level / flags / ssid
+00:11:22:33:44:55\t2412\t-40\t[WPA2-PSK-CCMP][ESS]\tHome\\x20WiFi
+00:11:22:33:44:66\t2412\t-80\t[WPA2-PSK-CCMP][ESS]\tHome\\x20WiFi
+00:11:22:33:44:77\t2462\t-70\t[ESS]\tCafe
+";
+
+        let networks = parse_scan_results(output);
+
+        assert_eq!(networks.len(), 2);
+        assert_eq!(networks[0].ssid, "Home WiFi");
+        assert_eq!(networks[0].security, "WPA2");
+        assert_eq!(networks[0].signal, 100);
+        assert_eq!(networks[1].ssid, "Cafe");
+        assert_eq!(networks[1].security, "Open");
+    }
+
+    #[test]
+    fn parse_ipv4_addr_extracts_cidr_address() {
+        let output = "2: wlan0    inet 192.168.1.24/24 brd 192.168.1.255 scope global wlan0\n";
+
+        assert_eq!(parse_ipv4_addr(output).as_deref(), Some("192.168.1.24"));
+    }
+
+    #[test]
+    fn format_wpa_psk_quotes_passphrases_but_not_raw_psk() {
+        let raw = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        assert_eq!(format_wpa_psk(raw), raw);
+        assert_eq!(format_wpa_psk("plain\"pass"), "\"plain\\\"pass\"");
+    }
+
+    #[test]
+    fn find_interface_owner_detects_common_wlan0_owners() {
+        let processes = "\
+root 480 1 0 ? 00:00:00 rkwifi_server start
+root 576 1 0 ? 00:00:00 wpa_supplicant -B -i wlan0 -c /data/wpa_supplicant.conf -d
+";
+
+        let owner = find_interface_owner(processes, "wlan0").expect("owner should be detected");
+
+        assert!(owner.contains("rkwifi_server") || owner.contains("wpa_supplicant"));
+    }
+
+    #[test]
+    fn find_interface_owner_ignores_other_interfaces() {
+        let processes = "root 576 1 0 ? 00:00:00 wpa_supplicant -B -i wlan1 -c /data/wpa.conf\n";
+
+        assert!(find_interface_owner(processes, "wlan0").is_none());
+    }
 }

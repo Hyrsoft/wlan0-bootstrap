@@ -1,0 +1,7 @@
+interface:
+  display_name: "Debug Buildroot ADB"
+  short_description: "Deploy and debug via ADB."
+  default_prompt: "Use $debug-buildroot-adb to deploy the ARMv7 wlan0-bootstrap binary to the ADB-connected Buildroot device and run focused device-side checks."
+
+policy:
+  allow_implicit_invocation: true

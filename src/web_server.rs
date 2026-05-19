@@ -4,6 +4,7 @@ use crate::networks::{KnownNetworks, NetworkStore};
 use crate::status::StatusPublisher;
 use crate::structs::{ConnectAccepted, ConnectionRequest, Network};
 use crate::traits::UiAssetProvider;
+use anyhow::Context;
 use axum::{
     Router,
     body::Body,
@@ -18,6 +19,12 @@ use std::sync::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisioningExit {
+    Connected,
+    IdleTimeout,
+}
 
 struct AppState {
     backend: Arc<WpaCtrlBackend>,
@@ -36,8 +43,11 @@ pub async fn run_server(
     known_networks: Arc<Mutex<KnownNetworks>>,
     store: NetworkStore,
     scanned_networks: Vec<Network>,
-) -> anyhow::Result<()> {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+) -> anyhow::Result<ProvisioningExit> {
+    // Web 服务只在配网窗口内运行。
+    // 连接成功或空闲超时都会触发 graceful shutdown，把控制权交还给主循环。
+    let (connected_tx, connected_rx) = oneshot::channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
     let app_state = Arc::new(AppState {
         backend: backend.clone(),
         status,
@@ -46,7 +56,7 @@ pub async fn run_server(
         scanned_networks,
         ui_provider: Arc::new(EmbedFrontend::new()),
         connect_in_progress: AtomicBool::new(false),
-        shutdown: Mutex::new(Some(shutdown_tx)),
+        shutdown: Mutex::new(Some(connected_tx)),
     });
 
     let app = Router::new()
@@ -62,15 +72,37 @@ pub async fn run_server(
     tracing::info!("provisioning web server listening on {}", bind_addr);
 
     let listener = TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        })
-        .await?;
-    Ok(())
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+    });
+
+    let idle_timeout = tokio::time::sleep(std::time::Duration::from_secs(
+        backend.config().timeouts.provisioning_idle_seconds,
+    ));
+
+    let exit = tokio::select! {
+        result = &mut server => {
+            result.context("provisioning web server task failed")??;
+            return Ok(ProvisioningExit::Connected);
+        }
+        _ = connected_rx => ProvisioningExit::Connected,
+        _ = idle_timeout => ProvisioningExit::IdleTimeout,
+    };
+
+    let _ = stop_tx.send(());
+    server
+        .await
+        .context("provisioning web server task failed")??;
+    Ok(exit)
 }
 
 async fn api_scan(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // 返回进入 AP 前的扫描缓存。
+    // 单射频设备此时正在提供 Soft AP，不在这里重新触发 STA 扫描。
     (StatusCode::OK, Json(state.scanned_networks.clone()))
 }
 
@@ -89,6 +121,8 @@ async fn api_connect(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ConnectionRequest>,
 ) -> impl IntoResponse {
+    // /api/connect 只表示请求已接收。
+    // 真实连接结果通过 /api/status 轮询，避免 HTTP 请求长时间挂起。
     if state
         .connect_in_progress
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -113,6 +147,8 @@ async fn api_connect(
 
         if result.is_ok() {
             {
+                // 当前阶段不调用额外派生工具，也不在程序内实现 PSK 派生。
+                // 连接成功后保存用户提交的密码字符串，后续自动连接继续交给 wpa_supplicant 处理。
                 let mut guard = state_for_task.known_networks.lock().await;
                 guard.upsert_success(&payload);
                 if let Err(err) = state_for_task.store.save(&guard).await {

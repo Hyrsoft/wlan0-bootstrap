@@ -131,7 +131,7 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    if (state === 'Failed' && status.last_error) {
+    if (status.last_error) {
       connectionStatus.textContent = `连接失败：${status.last_error.message}`;
       connectionStatus.style.color = '#ff6b6b';
       connectBtn.disabled = false;

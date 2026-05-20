@@ -21,6 +21,11 @@ html,body{height:100%;margin:0;font-family:Inter, ui-sans-serif, system-ui, -app
 .btn{border:0;padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:600}
 .btn.primary{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#ffffff;box-shadow:0 8px 24px rgba(0,86,214,0.12)}
 .btn.ghost{background:transparent;color:var(--muted);border:1px solid rgba(15,23,36,0.04)}
+.discovery-hint{margin-top:14px;padding:12px 14px;border:1px solid rgba(15,23,36,0.08);border-radius:10px;background:#f8fafc;display:flex;flex-direction:column;gap:4px}
+.discovery-hint:empty{display:none}
+.hint-title{font-size:12px;color:var(--muted)}
+.hint-link{font-size:15px;font-weight:800;color:var(--accent-2);word-break:break-all}
+.hint-note{font-size:12px;color:var(--muted);line-height:1.4}
 .card{margin-top:18px;background:var(--card);border-radius:var(--radius);padding:18px;box-shadow:0 8px 30px rgba(2,6,23,0.06);border:1px solid rgba(15,23,36,0.03)}
 .card-body{min-height:320px;display:flex;align-items:center}
 .wifi-list{width:100%;}
@@ -45,6 +50,14 @@ html,body{height:100%;margin:0;font-family:Inter, ui-sans-serif, system-ui, -app
 .input{width:100%;padding:10px;border-radius:10px;border:1px solid rgba(15,23,36,0.06);background:transparent;color:var(--text)}
 .modal-footer{display:flex;gap:10px;justify-content:flex-end;margin-top:14px}
 .status{margin-top:10px;font-size:13px}
+.status a,.connected-panel a{color:var(--accent-2);font-weight:700;text-decoration:none;word-break:break-all}
+.preconnect-hostname{margin-top:8px;color:var(--muted);line-height:1.45}
+.preconnect-hostname span{color:var(--accent-2);font-weight:700;word-break:break-all}
+.connected-panel{width:100%;display:flex;flex-direction:column;gap:12px;align-items:flex-start;padding:8px 2px}
+.connected-title{font-size:20px;font-weight:800;color:#0f766e}
+.connected-detail{display:flex;flex-direction:column;gap:8px;font-size:14px;line-height:1.5}
+.connected-note{font-size:13px;color:var(--muted);line-height:1.45}
+.discovery-warning{color:#b45309}
 .hidden{display:none}
 
 /* Signal bars (blue) */

@@ -52,8 +52,34 @@ pub struct StatusSnapshot {
     pub state: WifiState,
     pub ssid: Option<String>,
     pub address: Option<String>,
+    pub hostname: Option<String>,
+    pub services: Vec<PublishedService>,
+    pub discovery: DiscoveryStatus,
     pub last_error: Option<StatusError>,
     pub device: Option<DeviceProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PublishedService {
+    pub kind: String,
+    pub url: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiscoveryStatus {
+    pub mdns: MdnsState,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MdnsState {
+    Disabled,
+    Stopped,
+    Publishing,
+    Published,
+    Failed,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -63,6 +89,18 @@ pub enum StatusEvent {
         state: WifiState,
         ssid: Option<String>,
         address: Option<String>,
+    },
+    MdnsPublished {
+        hostname: String,
+        address: String,
+        port: u16,
+    },
+    MdnsFailed {
+        hostname: Option<String>,
+        reason: String,
+    },
+    MdnsStopped {
+        hostname: Option<String>,
     },
     ConnectionFailed {
         ssid: Option<String>,
@@ -100,6 +138,12 @@ impl StatusPublisher {
                 state: WifiState::Booting,
                 ssid: None,
                 address: None,
+                hostname: None,
+                services: Vec::new(),
+                discovery: DiscoveryStatus {
+                    mdns: MdnsState::Stopped,
+                    last_error: None,
+                },
                 last_error: None,
                 device: None,
             }),
@@ -243,6 +287,107 @@ impl StatusPublisher {
             reason,
             message,
         });
+        Ok(())
+    }
+
+    pub async fn set_mdns_disabled(&self) -> Result<()> {
+        {
+            let mut snapshot = self.snapshot.write().await;
+            snapshot.hostname = None;
+            snapshot.services.clear();
+            snapshot.discovery.mdns = MdnsState::Disabled;
+            snapshot.discovery.last_error = None;
+        }
+        self.write_snapshot().await
+    }
+
+    pub async fn set_discovery_hostname(&self, hostname: String) -> Result<()> {
+        {
+            let mut snapshot = self.snapshot.write().await;
+            snapshot.hostname = Some(hostname);
+            snapshot.discovery.mdns = MdnsState::Stopped;
+            snapshot.discovery.last_error = None;
+        }
+        self.write_snapshot().await
+    }
+
+    pub async fn set_mdns_publishing(
+        &self,
+        hostname: String,
+        address: String,
+        port: u16,
+    ) -> Result<()> {
+        {
+            let mut snapshot = self.snapshot.write().await;
+            snapshot.hostname = Some(hostname.clone());
+            snapshot.services = vec![PublishedService {
+                kind: "http".to_string(),
+                url: format!("http://{}", hostname.trim_end_matches('.')),
+                port,
+            }];
+            snapshot.discovery.mdns = MdnsState::Publishing;
+            snapshot.discovery.last_error = None;
+            if snapshot.address.is_none() {
+                snapshot.address = Some(address);
+            }
+        }
+        self.write_snapshot().await
+    }
+
+    pub async fn set_mdns_published(
+        &self,
+        hostname: String,
+        address: String,
+        port: u16,
+    ) -> Result<()> {
+        {
+            let mut snapshot = self.snapshot.write().await;
+            snapshot.hostname = Some(hostname.clone());
+            snapshot.services = vec![PublishedService {
+                kind: "http".to_string(),
+                url: format!("http://{}", hostname.trim_end_matches('.')),
+                port,
+            }];
+            snapshot.discovery.mdns = MdnsState::Published;
+            snapshot.discovery.last_error = None;
+        }
+        self.write_snapshot().await?;
+        let _ = self.events.send(StatusEvent::MdnsPublished {
+            hostname,
+            address,
+            port,
+        });
+        Ok(())
+    }
+
+    pub async fn set_mdns_failed(
+        &self,
+        hostname: Option<String>,
+        reason: impl Into<String>,
+    ) -> Result<()> {
+        let reason = reason.into();
+        {
+            let mut snapshot = self.snapshot.write().await;
+            snapshot.discovery.mdns = MdnsState::Failed;
+            snapshot.discovery.last_error = Some(reason.clone());
+        }
+        self.write_snapshot().await?;
+        let _ = self
+            .events
+            .send(StatusEvent::MdnsFailed { hostname, reason });
+        Ok(())
+    }
+
+    pub async fn set_mdns_stopped(&self, hostname: Option<String>) -> Result<()> {
+        {
+            let mut snapshot = self.snapshot.write().await;
+            snapshot.hostname = hostname.clone();
+            snapshot.services.clear();
+            snapshot.discovery.mdns = MdnsState::Stopped;
+            snapshot.discovery.last_error = None;
+        }
+        self.write_snapshot().await?;
+        let _ = self.events.send(StatusEvent::MdnsStopped { hostname });
         Ok(())
     }
 

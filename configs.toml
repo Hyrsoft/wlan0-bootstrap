@@ -45,3 +45,11 @@ wpa_update_config = false
 [platform]
 auto_driver_quirks = true
 ap_mode_reset_delay_ms = 600
+
+[discovery]
+mdns_enabled = true
+hostname_prefix = "wlan-bootstrap"
+hostname = ""
+http_service_enabled = true
+http_service_type = "_http._tcp.local."
+http_service_name = "wlan bootstrap"

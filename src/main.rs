@@ -1,6 +1,7 @@
 mod backend;
 mod config;
 mod device_profile;
+mod discovery;
 mod embed;
 mod networks;
 mod status;
@@ -9,7 +10,7 @@ mod traits;
 mod web_server;
 
 use anyhow::{Context, Result};
-use backend::WpaCtrlBackend;
+use backend::{ConnectedInfo, WpaCtrlBackend};
 use config::{AppConfig, CliOptions};
 use networks::{KnownNetworks, NetworkStore};
 use status::{ErrorReason, StatusPublisher};
@@ -29,6 +30,7 @@ async fn main() -> Result<()> {
     let config = Arc::new(AppConfig::load(&options)?);
     let status = StatusPublisher::new(config.status_path(), config.event_socket_path()).await?;
     status.start_event_server().await?;
+    initialize_discovery_status(&config, &status).await;
 
     let store = NetworkStore::new(config.networks_path());
     // 已知网络是本程序自己的持久化数据。
@@ -54,6 +56,23 @@ async fn main() -> Result<()> {
     result
 }
 
+async fn initialize_discovery_status(config: &Arc<AppConfig>, status: &Arc<StatusPublisher>) {
+    if !config.discovery.mdns_enabled || !config.discovery.http_service_enabled {
+        let _ = status.set_mdns_disabled().await;
+        return;
+    }
+
+    match discovery::resolve_discovery_hostname(config).await {
+        Ok(hostname) => {
+            let _ = status.set_discovery_hostname(hostname).await;
+        }
+        Err(err) => {
+            tracing::warn!("failed to resolve discovery hostname: {}", err);
+            let _ = status.set_mdns_failed(None, err.to_string()).await;
+        }
+    }
+}
+
 async fn run_loop(
     backend: Arc<WpaCtrlBackend>,
     status: Arc<StatusPublisher>,
@@ -68,7 +87,8 @@ async fn run_loop(
             Vec::new()
         });
 
-        if try_known_networks(&backend, &known_networks, &scanned, &store).await? {
+        if let Some(info) = try_known_networks(&backend, &known_networks, &scanned, &store).await? {
+            handle_connected(&backend, &status, info).await;
             continue;
         }
 
@@ -93,8 +113,17 @@ async fn run_loop(
             ProvisioningExit::Connected => {
                 // Web 服务只在连接成功后退出；这里拿到的是目标 STA SSID。
                 // 空闲超时会走 IdleTimeout 分支，避免误监控 AP SSID。
-                if let Some(ssid) = status.snapshot().await.ssid {
-                    backend.monitor_until_disconnected(&ssid).await;
+                let snapshot = status.snapshot().await;
+                if let Some(ssid) = snapshot.ssid {
+                    handle_connected(
+                        &backend,
+                        &status,
+                        ConnectedInfo {
+                            ssid,
+                            ip: snapshot.address,
+                        },
+                    )
+                    .await;
                 }
             }
             ProvisioningExit::IdleTimeout => {
@@ -105,12 +134,51 @@ async fn run_loop(
     }
 }
 
+async fn handle_connected(
+    backend: &Arc<WpaCtrlBackend>,
+    status: &Arc<StatusPublisher>,
+    info: ConnectedInfo,
+) {
+    let port = match backend.config().bind_addr() {
+        Ok(addr) => addr.port(),
+        Err(err) => {
+            let _ = status.set_mdns_failed(None, err.to_string()).await;
+            backend.monitor_until_disconnected(&info.ssid).await;
+            backend.stop_discovery().await;
+            return;
+        }
+    };
+
+    let connected_server = match web_server::run_connected_server(status.clone(), port).await {
+        Ok(server) => Some(server),
+        Err(err) => {
+            tracing::warn!("failed to start connected web server: {}", err);
+            let _ = status
+                .set_mdns_failed(None, format!("http server unavailable: {}", err))
+                .await;
+            None
+        }
+    };
+
+    if connected_server.is_some() {
+        let _ = backend.publish_connected_discovery(&info).await;
+    }
+    backend.monitor_until_disconnected(&info.ssid).await;
+    backend.stop_discovery().await;
+
+    if let Some(server) = connected_server
+        && let Err(err) = server.stop().await
+    {
+        tracing::warn!("failed to stop connected web server: {}", err);
+    }
+}
+
 async fn try_known_networks(
     backend: &Arc<WpaCtrlBackend>,
     known_networks: &Arc<Mutex<KnownNetworks>>,
     scanned: &[structs::Network],
     store: &NetworkStore,
-) -> Result<bool> {
+) -> Result<Option<ConnectedInfo>> {
     let candidates = {
         let guard = known_networks.lock().await;
         guard
@@ -132,8 +200,7 @@ async fn try_known_networks(
                 });
                 store.save(&guard).await?;
                 drop(guard);
-                backend.monitor_until_disconnected(&info.ssid).await;
-                return Ok(true);
+                return Ok(Some(info));
             }
             Err(err) => {
                 tracing::warn!("failed to connect known network {}: {}", known.ssid, err);
@@ -141,5 +208,5 @@ async fn try_known_networks(
         }
     }
 
-    Ok(false)
+    Ok(None)
 }

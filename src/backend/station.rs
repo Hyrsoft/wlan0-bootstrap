@@ -31,6 +31,7 @@ impl WpaCtrlBackend {
             };
 
             if parse_wpa_state(&status) != Some("COMPLETED") {
+                self.stop_discovery().await;
                 let _ = self
                     .status
                     .set_state(WifiState::Reconnecting, Some(ssid.to_string()), None)

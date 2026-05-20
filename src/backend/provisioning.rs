@@ -14,6 +14,7 @@ impl WpaCtrlBackend {
             self.config.ap.bind_addr,
             self.config.ap.gateway_cidr
         );
+        self.stop_discovery().await;
         self.set_provisioning_state(WifiState::ProvisioningApStarting, None, None)
             .await?;
         if let Err(err) = self.start_ap().await {

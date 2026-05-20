@@ -51,6 +51,9 @@ async-trait = "0.1.79"
 # MIME 类型推断
 mime_guess = "2.0.5"
 
+# mDNS / DNS-SD 设备发现
+mdns-sd = "0.19.2"
+
 # release 配置
 [profile.release]
 opt-level = "z"

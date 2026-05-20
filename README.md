@@ -106,6 +106,7 @@ cross build \
 ## 开发文档
 
 - [AGENT.md](AGENT.md)：后续 AI/开发者入口说明。
+- [docs/HANDOVER.md](docs/HANDOVER.md)：工作交接说明。
 - [docs/REFACTOR_BLUEPRINT.md](docs/REFACTOR_BLUEPRINT.md)：重构蓝图。
 - [docs/RUST_CODE_STYLE.md](docs/RUST_CODE_STYLE.md)：Rust 代码规范。
 - [docs/DEVICE_TEST_FLOW.md](docs/DEVICE_TEST_FLOW.md)：真实 Buildroot 设备测试流程。
